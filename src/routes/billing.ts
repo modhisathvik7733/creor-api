@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription } from "../lib/razorpay.ts"
+import { createRazorpayOrder, createRazorpaySubscription, createRazorpayPlan } from "../lib/razorpay.ts"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -70,22 +70,31 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
   const planConfig = PLAN_CONFIG[plan]
 
-  const subscription = await createRazorpaySubscription({
-    planId: planConfig.razorpayPlanId,
-    totalCount: 12, // 12 months
-    notes: {
-      workspaceId: auth.workspaceId,
-      userId: auth.userId,
-      plan,
-    },
-  })
+  if (!planConfig.razorpayPlanId) {
+    return c.json({ error: `Razorpay plan ID not configured for "${plan}". Run POST /api/billing/setup-plans first.` }, 500)
+  }
 
-  return c.json({
-    subscriptionId: subscription.id,
-    shortUrl: subscription.short_url,
-    plan,
-    price: planConfig.price,
-  })
+  try {
+    const subscription = await createRazorpaySubscription({
+      planId: planConfig.razorpayPlanId,
+      totalCount: 12, // 12 months
+      notes: {
+        workspaceId: auth.workspaceId,
+        userId: auth.userId,
+        plan,
+      },
+    })
+
+    return c.json({
+      subscriptionId: subscription.id,
+      shortUrl: subscription.short_url,
+      plan,
+      price: planConfig.price,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Razorpay subscription creation failed"
+    return c.json({ error: message }, 500)
+  }
 })
 
 // ── Update monthly limit ──
@@ -131,9 +140,47 @@ billingRoutes.get("/subscription", async (c) => {
   })
 })
 
+// ── Setup Razorpay plans (one-time admin endpoint) ──
+
+billingRoutes.post("/setup-plans", requireAdmin, async (c) => {
+  const results: Record<string, string> = {}
+
+  for (const [name, config] of Object.entries(PLAN_CONFIG)) {
+    if (config.razorpayPlanId) {
+      results[name] = `already configured: ${config.razorpayPlanId}`
+      continue
+    }
+
+    try {
+      const plan = await createRazorpayPlan({
+        name: `Creor ${name.charAt(0).toUpperCase() + name.slice(1)}`,
+        amount: config.price * 100, // INR to paise
+        currency: "INR",
+        description: `Creor ${name} monthly subscription`,
+      })
+      results[name] = plan.id
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to create plan"
+      results[name] = `error: ${message}`
+    }
+  }
+
+  return c.json({
+    message: "Set these plan IDs as Supabase secrets (RAZORPAY_PLAN_STARTER, RAZORPAY_PLAN_PRO, RAZORPAY_PLAN_TEAM)",
+    plans: results,
+  })
+})
+
 // ── Plan configuration (INR pricing) ──
 
-const PLAN_CONFIG = {
+const PLAN_CONFIG: Record<string, {
+  price: number
+  currency: string
+  razorpayPlanId: string
+  weeklyLimit: number
+  rollingWindow: number
+  rollingLimit: number
+}> = {
   starter: {
     price: 499,
     currency: "INR",
@@ -158,4 +205,4 @@ const PLAN_CONFIG = {
     rollingWindow: 24,
     rollingLimit: 200_000_000,
   },
-} as const
+}

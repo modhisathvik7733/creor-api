@@ -13,7 +13,7 @@ webhookRoutes.post("/razorpay", async (c) => {
   const body = await c.req.text()
   const signature = c.req.header("x-razorpay-signature")
 
-  if (!signature || !verifyRazorpaySignature(body, signature)) {
+  if (!signature || !(await verifyRazorpaySignature(body, signature))) {
     return c.json({ error: "Invalid signature" }, 400)
   }
 

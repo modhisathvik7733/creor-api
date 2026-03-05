@@ -1,16 +1,30 @@
-import Razorpay from "razorpay"
-import crypto from "node:crypto"
+const RAZORPAY_BASE = "https://api.razorpay.com/v1"
 
-let instance: Razorpay | null = null
+function getAuth(): string {
+  const keyId = process.env.RAZORPAY_KEY_ID
+  const keySecret = process.env.RAZORPAY_KEY_SECRET
+  if (!keyId || !keySecret) throw new Error("Razorpay credentials not configured")
+  return btoa(`${keyId}:${keySecret}`)
+}
 
-function getRazorpay(): Razorpay {
-  if (!instance) {
-    instance = new Razorpay({
-      key_id: process.env.RAZORPAY_KEY_ID!,
-      key_secret: process.env.RAZORPAY_KEY_SECRET!,
-    })
+async function rzFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${RAZORPAY_BASE}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Basic ${getAuth()}`,
+      ...(options.headers as Record<string, string>),
+    },
+  })
+
+  const body = await res.json()
+
+  if (!res.ok) {
+    const errMsg = body?.error?.description ?? body?.error ?? JSON.stringify(body)
+    throw new Error(`Razorpay API error (${res.status}): ${errMsg}`)
   }
-  return instance
+
+  return body as T
 }
 
 /** Create a one-time payment order */
@@ -20,13 +34,44 @@ export async function createRazorpayOrder(params: {
   receipt: string
   notes?: Record<string, string>
 }) {
-  const rz = getRazorpay()
-  return rz.orders.create({
-    amount: params.amount,
-    currency: params.currency,
-    receipt: params.receipt,
-    notes: params.notes,
-  })
+  return rzFetch<{ id: string; amount: number; currency: string; status: string }>(
+    "/orders",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        amount: params.amount,
+        currency: params.currency,
+        receipt: params.receipt,
+        notes: params.notes,
+      }),
+    },
+  )
+}
+
+/** Create a subscription plan in Razorpay */
+export async function createRazorpayPlan(params: {
+  name: string
+  amount: number // in paise
+  currency: string
+  description?: string
+  period?: "monthly" | "yearly"
+}) {
+  return rzFetch<{ id: string; item: { name: string; amount: number } }>(
+    "/plans",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        period: params.period ?? "monthly",
+        interval: 1,
+        item: {
+          name: params.name,
+          amount: params.amount,
+          currency: params.currency,
+          description: params.description ?? params.name,
+        },
+      }),
+    },
+  )
 }
 
 /** Create a recurring subscription */
@@ -35,41 +80,71 @@ export async function createRazorpaySubscription(params: {
   totalCount: number
   notes?: Record<string, string>
 }) {
-  const rz = getRazorpay()
-  return rz.subscriptions.create({
-    plan_id: params.planId,
-    total_count: params.totalCount,
-    notes: params.notes,
-  })
+  if (!params.planId) {
+    throw new Error("Razorpay plan ID is not configured for this plan")
+  }
+  return rzFetch<{ id: string; short_url: string; status: string }>(
+    "/subscriptions",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        plan_id: params.planId,
+        total_count: params.totalCount,
+        notes: params.notes,
+      }),
+    },
+  )
 }
 
 /** Cancel a subscription */
 export async function cancelRazorpaySubscription(subscriptionId: string) {
-  const rz = getRazorpay()
-  return rz.subscriptions.cancel(subscriptionId)
+  return rzFetch<{ id: string; status: string }>(
+    `/subscriptions/${subscriptionId}/cancel`,
+    { method: "POST" },
+  )
 }
 
-/** Verify webhook signature */
-export function verifyRazorpaySignature(body: string, signature: string): boolean {
-  const secret = process.env.RAZORPAY_WEBHOOK_SECRET!
-  const expectedSignature = crypto
-    .createHmac("sha256", secret)
-    .update(body)
-    .digest("hex")
+/** Verify webhook signature using Web Crypto API (Deno-compatible) */
+export async function verifyRazorpaySignature(body: string, signature: string): Promise<boolean> {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET
+  if (!secret) throw new Error("RAZORPAY_WEBHOOK_SECRET not configured")
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  )
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body))
+  const expectedSignature = Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+
   return expectedSignature === signature
 }
 
-/** Verify payment signature (for checkout validation) */
-export function verifyPaymentSignature(params: {
+/** Verify payment signature using Web Crypto API (Deno-compatible) */
+export async function verifyPaymentSignature(params: {
   orderId: string
   paymentId: string
   signature: string
-}): boolean {
-  const secret = process.env.RAZORPAY_KEY_SECRET!
-  const body = `${params.orderId}|${params.paymentId}`
-  const expectedSignature = crypto
-    .createHmac("sha256", secret)
-    .update(body)
-    .digest("hex")
+}): Promise<boolean> {
+  const secret = process.env.RAZORPAY_KEY_SECRET
+  if (!secret) throw new Error("RAZORPAY_KEY_SECRET not configured")
+
+  const data = `${params.orderId}|${params.paymentId}`
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  )
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data))
+  const expectedSignature = Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+
   return expectedSignature === params.signature
 }
