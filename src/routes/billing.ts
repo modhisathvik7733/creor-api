@@ -5,7 +5,8 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription, createRazorpayPlan } from "../lib/razorpay.ts"
+import { createRazorpayOrder, createRazorpaySubscription, createRazorpayPlan, verifyPaymentSignature } from "../lib/razorpay.ts"
+import { sql } from "drizzle-orm"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -55,18 +56,53 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
     },
   })
 
-  return c.json({ orderId: order.id, amount, currency: "INR" })
+  return c.json({
+    orderId: order.id,
+    amount,
+    amountPaise: amount * 100,
+    currency: "INR",
+    keyId: process.env.RAZORPAY_KEY_ID ?? "",
+  })
+})
+
+// ── Verify payment and credit balance instantly ──
+
+const verifyPaymentSchema = z.object({
+  razorpay_order_id: z.string(),
+  razorpay_payment_id: z.string(),
+  razorpay_signature: z.string(),
+})
+
+billingRoutes.post("/verify-payment", requireAdmin, zValidator("json", verifyPaymentSchema), async (c) => {
+  const auth = c.get("auth")
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = c.req.valid("json")
+
+  const valid = await verifyPaymentSignature({
+    orderId: razorpay_order_id,
+    paymentId: razorpay_payment_id,
+    signature: razorpay_signature,
+  })
+
+  if (!valid) {
+    return c.json({ error: "Invalid payment signature" }, 400)
+  }
+
+  // Extract amount from the order ID receipt (credits_{workspaceId}_{timestamp})
+  // The webhook will also credit, but we use idempotent logic via the payment ID
+  // For now, we rely on the webhook for actual crediting and just confirm success
+  return c.json({ success: true, paymentId: razorpay_payment_id })
 })
 
 // ── Subscribe to Creor Pro ──
 
 const subscribeSchema = z.object({
   plan: z.enum(["starter", "pro", "team"]),
+  callbackUrl: z.string().url().optional(),
 })
 
 billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchema), async (c) => {
   const auth = c.get("auth")
-  const { plan } = c.req.valid("json")
+  const { plan, callbackUrl } = c.req.valid("json")
 
   const planConfig = getPlanConfig()[plan]
 
@@ -78,6 +114,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     const subscription = await createRazorpaySubscription({
       planId: planConfig.razorpayPlanId,
       totalCount: 12, // 12 months
+      callbackUrl,
       notes: {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
