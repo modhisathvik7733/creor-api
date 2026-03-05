@@ -1,11 +1,25 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { billing, subscriptions } from "../db/schema.ts"
+import { billing, subscriptions, webhookEvents } from "../db/schema.ts"
 import { eq, sql } from "drizzle-orm"
 import { verifyRazorpaySignature } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
 
 export const webhookRoutes = new Hono()
+
+/** Claim a webhook event for idempotent processing. Returns true if new. */
+async function claimEvent(eventId: string, eventType: string): Promise<boolean> {
+  try {
+    await db.insert(webhookEvents).values({
+      id: createId("whe"),
+      eventId,
+      eventType,
+    })
+    return true
+  } catch {
+    return false // unique constraint = already processed
+  }
+}
 
 // ── Razorpay webhook handler ──
 
@@ -18,6 +32,17 @@ webhookRoutes.post("/razorpay", async (c) => {
   }
 
   const event = JSON.parse(body) as RazorpayWebhookEvent
+
+  // Idempotency: derive a unique event ID from the entity
+  const entityId =
+    event.payload.payment?.entity?.id ??
+    event.payload.subscription?.entity?.id ??
+    "unknown"
+  const eventKey = `${event.event}:${entityId}`
+
+  if (!(await claimEvent(eventKey, event.event))) {
+    return c.json({ status: "ok", note: "duplicate" })
+  }
 
   switch (event.event) {
     case "payment.captured": {

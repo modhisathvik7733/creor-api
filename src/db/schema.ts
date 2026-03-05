@@ -229,6 +229,15 @@ export const shares = pgTable("shares", {
   timeDeleted: timestamp("time_deleted"),
 })
 
+// ── Webhook Events (idempotency) ──
+
+export const webhookEvents = pgTable("webhook_events", {
+  id: text("id").primaryKey(),
+  eventId: text("event_id").notNull().unique(),
+  eventType: text("event_type").notNull(),
+  timeCreated: timestamp("time_created").defaultNow().notNull(),
+})
+
 // ── Invites ──
 
 export const invites = pgTable(
