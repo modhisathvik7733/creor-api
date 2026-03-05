@@ -1,8 +1,9 @@
 import { Hono } from "hono"
 import { db } from "../db/client"
 import { keys, billing, usage, subscriptions } from "../db/schema"
-import { eq, and, isNull } from "drizzle-orm"
+import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "../lib/id"
+import { getModelCost } from "../lib/models"
 
 export const gatewayRoutes = new Hono()
 
@@ -215,18 +216,16 @@ async function trackUsageAsync(
   model: string,
   provider: string,
   usageData: { prompt_tokens?: number; completion_tokens?: number } | undefined,
-  _hasSubscription: boolean,
+  hasSubscription: boolean,
 ) {
   if (!usageData) return
 
   const inputTokens = usageData.prompt_tokens ?? 0
   const outputTokens = usageData.completion_tokens ?? 0
 
-  // Simple cost calculation (USD per 1M tokens, stored as micro-paise)
-  // This is a placeholder — real costs should come from a config
-  const costPerInputToken = 0.003 / 1_000_000
-  const costPerOutputToken = 0.015 / 1_000_000
-  const costUSD = inputTokens * costPerInputToken + outputTokens * costPerOutputToken
+  // Per-model cost (USD per 1K tokens) → micro-paise
+  const modelCost = getModelCost(model)
+  const costUSD = (inputTokens * modelCost.input + outputTokens * modelCost.output) / 1_000
   const costMicroPaise = Math.round(costUSD * 85 * 1_000_000) // USD → INR → micro-paise
 
   try {
@@ -240,6 +239,14 @@ async function trackUsageAsync(
       outputTokens,
       cost: costMicroPaise,
     })
+
+    // Deduct from balance (skip for subscription users)
+    if (!hasSubscription && costMicroPaise > 0) {
+      await db
+        .update(billing)
+        .set({ balance: sql`${billing.balance} - ${costMicroPaise}` })
+        .where(eq(billing.workspaceId, keyData.workspaceId))
+    }
   } catch (err) {
     console.error("Failed to track usage:", err)
   }

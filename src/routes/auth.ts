@@ -13,10 +13,11 @@ export const authRoutes = new Hono()
 
 const githubCallbackSchema = z.object({
   code: z.string(),
+  redirect_uri: z.string().optional(),
 })
 
 authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), async (c) => {
-  const { code } = c.req.valid("json")
+  const { code, redirect_uri } = c.req.valid("json")
 
   // Exchange code for access token
   const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
@@ -29,12 +30,14 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
       client_id: process.env.GITHUB_CLIENT_ID,
       client_secret: process.env.GITHUB_CLIENT_SECRET,
       code,
+      ...(redirect_uri && { redirect_uri }),
     }),
   })
 
-  const tokenData = (await tokenRes.json()) as { access_token?: string; error?: string }
+  const tokenData = (await tokenRes.json()) as { access_token?: string; error?: string; error_description?: string }
   if (!tokenData.access_token) {
-    return c.json({ error: "GitHub OAuth failed" }, 400)
+    console.error("GitHub OAuth token exchange failed:", JSON.stringify(tokenData))
+    return c.json({ error: tokenData.error_description ?? tokenData.error ?? "GitHub OAuth failed" }, 400)
   }
 
   // Get user info from GitHub
@@ -49,18 +52,28 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
     avatar_url: string
   }
 
-  // Get primary email if not public
+  // Get primary email — try profile first, then /user/emails, then fallback
   let email = githubUser.email
   if (!email) {
-    const emailRes = await fetch("https://api.github.com/user/emails", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` },
-    })
-    const emails = (await emailRes.json()) as Array<{ email: string; primary: boolean }>
-    email = emails.find((e) => e.primary)?.email ?? emails[0]?.email ?? null
+    try {
+      const emailRes = await fetch("https://api.github.com/user/emails", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}` },
+      })
+      const emailsData = await emailRes.json()
+      const emails = Array.isArray(emailsData) ? emailsData as Array<{ email: string; primary: boolean; verified: boolean }> : []
+      email = emails.find((e) => e.primary && e.verified)?.email
+        ?? emails.find((e) => e.primary)?.email
+        ?? emails.find((e) => e.verified)?.email
+        ?? emails[0]?.email
+        ?? null
+    } catch {
+      // emails endpoint failed, continue with fallback
+    }
   }
 
   if (!email) {
-    return c.json({ error: "Could not retrieve email from GitHub" }, 400)
+    // Last resort: use noreply email GitHub provides
+    email = `${githubUser.id}+${githubUser.login}@users.noreply.github.com`
   }
 
   // Find or create user
@@ -84,7 +97,7 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
     await db.insert(workspaces).values({
       id: workspaceId,
       name: githubUser.name ?? githubUser.login,
-      slug: githubUser.login.toLowerCase(),
+      slug: await uniqueSlug(githubUser.login.toLowerCase()),
     })
 
     await db.insert(users).values({
@@ -133,9 +146,10 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
     }),
   })
 
-  const tokenData = (await tokenRes.json()) as { access_token?: string; id_token?: string }
+  const tokenData = (await tokenRes.json()) as { access_token?: string; id_token?: string; error?: string; error_description?: string }
   if (!tokenData.access_token) {
-    return c.json({ error: "Google OAuth failed" }, 400)
+    console.error("Google OAuth token exchange failed:", JSON.stringify(tokenData))
+    return c.json({ error: tokenData.error_description ?? tokenData.error ?? "Google OAuth failed" }, 400)
   }
 
   // Get user info
@@ -166,7 +180,7 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
     workspaceId = createId("ws")
     userId = createId("usr")
 
-    const slug = googleUser.email.split("@")[0].toLowerCase().replace(/[^a-z0-9-]/g, "")
+    const slug = await uniqueSlug(googleUser.email.split("@")[0].toLowerCase())
 
     await db.insert(workspaces).values({
       id: workspaceId,
@@ -214,7 +228,21 @@ authRoutes.post("/refresh", async (c) => {
   }
 })
 
-// ── Helper ──
+// ── Helpers ──
+
+async function uniqueSlug(base: string): Promise<string> {
+  let slug = base.replace(/[^a-z0-9-]/g, "").slice(0, 48)
+  const existing = await db
+    .select({ slug: workspaces.slug })
+    .from(workspaces)
+    .where(eq(workspaces.slug, slug))
+    .then((rows) => rows[0])
+  if (existing) {
+    const suffix = Math.random().toString(36).slice(2, 6)
+    slug = `${slug}-${suffix}`
+  }
+  return slug
+}
 
 async function createJWT(userId: string, workspaceId: string): Promise<string> {
   const secret = new TextEncoder().encode(process.env.JWT_SECRET!)

@@ -1,7 +1,7 @@
 import { Hono } from "hono"
 import { db } from "../db/client"
 import { billing, subscriptions } from "../db/schema"
-import { eq } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 import { verifyRazorpaySignature } from "../lib/razorpay"
 import { createId } from "../lib/id"
 
@@ -33,15 +33,10 @@ webhookRoutes.post("/razorpay", async (c) => {
         await db
           .update(billing)
           .set({
-            balance: billing.balance, // Will use SQL increment
+            balance: sql`${billing.balance} + ${microPaise}`,
             timeUpdated: new Date(),
           })
           .where(eq(billing.workspaceId, workspaceId))
-
-        // Use raw SQL for atomic increment
-        await db.execute(
-          `UPDATE billing SET balance = balance + ${microPaise}, time_updated = NOW() WHERE workspace_id = '${workspaceId}'`,
-        )
       }
       break
     }

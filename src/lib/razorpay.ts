@@ -1,5 +1,5 @@
 import Razorpay from "razorpay"
-import crypto from "crypto"
+import crypto from "node:crypto"
 
 let instance: Razorpay | null = null
 

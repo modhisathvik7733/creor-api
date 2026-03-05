@@ -1,0 +1,20 @@
+{
+  "imports": {
+    "hono": "npm:hono@^4.7.0",
+    "hono/cors": "npm:hono@^4.7.0/cors",
+    "hono/logger": "npm:hono@^4.7.0/logger",
+    "hono/factory": "npm:hono@^4.7.0/factory",
+    "@hono/zod-validator": "npm:@hono/zod-validator@^0.4.2",
+    "drizzle-orm": "npm:drizzle-orm@^0.38.0",
+    "drizzle-orm/postgres-js": "npm:drizzle-orm@^0.38.0/postgres-js",
+    "drizzle-orm/pg-core": "npm:drizzle-orm@^0.38.0/pg-core",
+    "postgres": "npm:postgres@^3.4.5",
+    "jose": "npm:jose@^6.0.0",
+    "zod": "npm:zod@^3.24.0",
+    "ulid": "npm:ulid@^2.3.0",
+    "razorpay": "npm:razorpay@^2.9.5"
+  },
+  "compilerOptions": {
+    "lib": ["deno.ns", "esnext"]
+  }
+}
