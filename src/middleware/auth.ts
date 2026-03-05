@@ -24,6 +24,7 @@ export const requireAuth = createMiddleware<{
   }
 
   const token = header.slice(7)
+  let verified = false
   try {
     const secret = new TextEncoder().encode(process.env.JWT_SECRET!)
     const { payload } = await jwtVerify(token, secret)
@@ -55,10 +56,13 @@ export const requireAuth = createMiddleware<{
       email: user.email,
       role: user.role as AuthContext["role"],
     })
-
-    await next()
+    verified = true
   } catch {
     return c.json({ error: "Invalid or expired token" }, 401)
+  }
+
+  if (verified) {
+    await next()
   }
 })
 
