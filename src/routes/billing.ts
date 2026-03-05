@@ -68,7 +68,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
   const auth = c.get("auth")
   const { plan } = c.req.valid("json")
 
-  const planConfig = PLAN_CONFIG[plan]
+  const planConfig = getPlanConfig()[plan]
 
   if (!planConfig.razorpayPlanId) {
     return c.json({ error: `Razorpay plan ID not configured for "${plan}". Run POST /api/billing/setup-plans first.` }, 500)
@@ -136,7 +136,7 @@ billingRoutes.get("/subscription", async (c) => {
   return c.json({
     active: true,
     plan: sub.plan,
-    ...PLAN_CONFIG[sub.plan as keyof typeof PLAN_CONFIG],
+    ...getPlanConfig()[sub.plan],
   })
 })
 
@@ -145,7 +145,7 @@ billingRoutes.get("/subscription", async (c) => {
 billingRoutes.post("/setup-plans", requireAdmin, async (c) => {
   const results: Record<string, string> = {}
 
-  for (const [name, config] of Object.entries(PLAN_CONFIG)) {
+  for (const [name, config] of Object.entries(getPlanConfig())) {
     if (config.razorpayPlanId) {
       results[name] = `already configured: ${config.razorpayPlanId}`
       continue
@@ -172,37 +172,42 @@ billingRoutes.post("/setup-plans", requireAdmin, async (c) => {
 })
 
 // ── Plan configuration (INR pricing) ──
+// NOTE: Must be a function — process.env shim isn't ready at module scope in Deno edge functions
 
-const PLAN_CONFIG: Record<string, {
+type PlanConfig = {
   price: number
   currency: string
   razorpayPlanId: string
   weeklyLimit: number
   rollingWindow: number
   rollingLimit: number
-}> = {
-  starter: {
-    price: 499,
-    currency: "INR",
-    razorpayPlanId: process.env.RAZORPAY_PLAN_STARTER ?? "",
-    weeklyLimit: 50_000_000, // micro-paise
-    rollingWindow: 24, // hours
-    rollingLimit: 20_000_000,
-  },
-  pro: {
-    price: 1999,
-    currency: "INR",
-    razorpayPlanId: process.env.RAZORPAY_PLAN_PRO ?? "",
-    weeklyLimit: 200_000_000,
-    rollingWindow: 24,
-    rollingLimit: 80_000_000,
-  },
-  team: {
-    price: 4999,
-    currency: "INR",
-    razorpayPlanId: process.env.RAZORPAY_PLAN_TEAM ?? "",
-    weeklyLimit: 500_000_000,
-    rollingWindow: 24,
-    rollingLimit: 200_000_000,
-  },
+}
+
+function getPlanConfig(): Record<string, PlanConfig> {
+  return {
+    starter: {
+      price: 499,
+      currency: "INR",
+      razorpayPlanId: process.env.RAZORPAY_PLAN_STARTER ?? "",
+      weeklyLimit: 50_000_000, // micro-paise
+      rollingWindow: 24, // hours
+      rollingLimit: 20_000_000,
+    },
+    pro: {
+      price: 1999,
+      currency: "INR",
+      razorpayPlanId: process.env.RAZORPAY_PLAN_PRO ?? "",
+      weeklyLimit: 200_000_000,
+      rollingWindow: 24,
+      rollingLimit: 80_000_000,
+    },
+    team: {
+      price: 4999,
+      currency: "INR",
+      razorpayPlanId: process.env.RAZORPAY_PLAN_TEAM ?? "",
+      weeklyLimit: 500_000_000,
+      rollingWindow: 24,
+      rollingLimit: 200_000_000,
+    },
+  }
 }
