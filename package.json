@@ -1,0 +1,33 @@
+{
+  "name": "creor-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "hono": "^4.7.0",
+    "@hono/zod-validator": "^0.4.2",
+    "drizzle-orm": "^0.38.0",
+    "postgres": "^3.4.5",
+    "@supabase/supabase-js": "^2.49.0",
+    "razorpay": "^2.9.5",
+    "zod": "^3.24.0",
+    "ulid": "^2.3.0",
+    "jose": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "drizzle-kit": "^0.30.0",
+    "typescript": "^5.8.0"
+  }
+}
