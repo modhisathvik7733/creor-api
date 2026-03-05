@@ -7,6 +7,24 @@ import { getModelCost } from "../lib/models.ts"
 
 export const gatewayRoutes = new Hono()
 
+// ── In-memory rate limiting ──
+
+const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minute
+const RATE_LIMIT_MAX = 60 // requests per minute per key
+
+const rateLimitMap = new Map<string, { count: number; windowStart: number }>()
+
+function checkRateLimit(keyId: string): boolean {
+  const now = Date.now()
+  const entry = rateLimitMap.get(keyId)
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateLimitMap.set(keyId, { count: 1, windowStart: now })
+    return true
+  }
+  entry.count++
+  return entry.count <= RATE_LIMIT_MAX
+}
+
 /**
  * Creor Gateway — LLM proxy endpoint.
  *
@@ -73,6 +91,43 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       },
       402,
     )
+  }
+
+  // Rate limit check
+  if (!checkRateLimit(keyData.id)) {
+    return c.json(
+      { error: { type: "RateLimitError", message: "Too many requests. Limit: 60/minute." } },
+      429,
+    )
+  }
+
+  // Monthly limit check (live query from usage table)
+  if (bill.monthlyLimit && bill.monthlyLimit > 0) {
+    const monthStart = new Date()
+    monthStart.setDate(1)
+    monthStart.setHours(0, 0, 0, 0)
+    const [{ total }] = await db
+      .select({ total: sql<number>`COALESCE(SUM(${usage.cost}), 0)` })
+      .from(usage)
+      .where(
+        and(
+          eq(usage.workspaceId, keyData.workspaceId),
+          sql`${usage.timeCreated} >= ${monthStart.toISOString()}`,
+        ),
+      )
+    // monthlyLimit is in INR, total is in micro-paise → convert limit to micro-paise
+    const limitMicroPaise = bill.monthlyLimit * 1_000_000
+    if (total >= limitMicroPaise) {
+      return c.json(
+        {
+          error: {
+            type: "LimitError",
+            message: "Monthly usage limit reached. Increase your limit at https://creor.ai/dashboard/billing",
+          },
+        },
+        402,
+      )
+    }
   }
 
   // Parse request
