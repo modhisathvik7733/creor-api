@@ -1,11 +1,11 @@
 import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
-import { db } from "../db/client"
-import { shares } from "../db/schema"
+import { db } from "../db/client.ts"
+import { shares } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
-import { createId } from "../lib/id"
-import { requireAuth } from "../middleware/auth"
+import { createId } from "../lib/id.ts"
+import { requireAuth } from "../middleware/auth.ts"
 
 export const shareRoutes = new Hono()
 

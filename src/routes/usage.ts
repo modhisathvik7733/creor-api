@@ -1,8 +1,8 @@
 import { Hono } from "hono"
-import { db } from "../db/client"
-import { usage } from "../db/schema"
+import { db } from "../db/client.ts"
+import { usage } from "../db/schema.ts"
 import { eq, and, gte, sql } from "drizzle-orm"
-import { requireAuth, type AuthContext } from "../middleware/auth"
+import { requireAuth, type AuthContext } from "../middleware/auth.ts"
 
 export const usageRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 

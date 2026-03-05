@@ -1,6 +1,6 @@
 import { drizzle } from "drizzle-orm/postgres-js"
 import postgres from "postgres"
-import * as schema from "./schema"
+import * as schema from "./schema.ts"
 
 // Use SUPABASE_DB_URL (auto-provided in edge functions) or fall back to individual params
 const dbUrl = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL

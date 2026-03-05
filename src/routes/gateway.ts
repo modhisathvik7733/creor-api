@@ -1,9 +1,9 @@
 import { Hono } from "hono"
-import { db } from "../db/client"
-import { keys, billing, usage, subscriptions } from "../db/schema"
+import { db } from "../db/client.ts"
+import { keys, billing, usage, subscriptions } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
-import { createId } from "../lib/id"
-import { getModelCost } from "../lib/models"
+import { createId } from "../lib/id.ts"
+import { getModelCost } from "../lib/models.ts"
 
 export const gatewayRoutes = new Hono()
 

@@ -1,7 +1,7 @@
 import { createMiddleware } from "hono/factory"
 import { jwtVerify } from "jose"
-import { db } from "../db/client"
-import { users } from "../db/schema"
+import { db } from "../db/client.ts"
+import { users } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
 
 export type AuthContext = {

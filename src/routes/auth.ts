@@ -2,10 +2,10 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { SignJWT } from "jose"
-import { db } from "../db/client"
-import { users, workspaces, billing } from "../db/schema"
+import { db } from "../db/client.ts"
+import { users, workspaces, billing } from "../db/schema.ts"
 import { eq, and } from "drizzle-orm"
-import { createId } from "../lib/id"
+import { createId } from "../lib/id.ts"
 
 export const authRoutes = new Hono()
 

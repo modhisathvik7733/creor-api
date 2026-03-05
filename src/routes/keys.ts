@@ -1,11 +1,11 @@
 import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
-import { db } from "../db/client"
-import { keys } from "../db/schema"
+import { db } from "../db/client.ts"
+import { keys } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
-import { requireAuth, type AuthContext } from "../middleware/auth"
-import { createId } from "../lib/id"
+import { requireAuth, type AuthContext } from "../middleware/auth.ts"
+import { createId } from "../lib/id.ts"
 
 export const keyRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 

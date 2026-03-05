@@ -1,5 +1,5 @@
 import { Hono } from "hono"
-import { GATEWAY_MODELS, type ModelId } from "../lib/models"
+import { GATEWAY_MODELS, type ModelId } from "../lib/models.ts"
 
 export const modelRoutes = new Hono()
 

@@ -1,11 +1,11 @@
 import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
-import { db } from "../db/client"
-import { billing, subscriptions } from "../db/schema"
+import { db } from "../db/client.ts"
+import { billing, subscriptions } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
-import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth"
-import { createRazorpayOrder, createRazorpaySubscription } from "../lib/razorpay"
+import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
+import { createRazorpayOrder, createRazorpaySubscription } from "../lib/razorpay.ts"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 

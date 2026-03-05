@@ -1,9 +1,9 @@
 import { Hono } from "hono"
-import { db } from "../db/client"
-import { billing, subscriptions } from "../db/schema"
+import { db } from "../db/client.ts"
+import { billing, subscriptions } from "../db/schema.ts"
 import { eq, sql } from "drizzle-orm"
-import { verifyRazorpaySignature } from "../lib/razorpay"
-import { createId } from "../lib/id"
+import { verifyRazorpaySignature } from "../lib/razorpay.ts"
+import { createId } from "../lib/id.ts"
 
 export const webhookRoutes = new Hono()
 
