@@ -238,6 +238,28 @@ export const webhookEvents = pgTable("webhook_events", {
   timeCreated: timestamp("time_created").defaultNow().notNull(),
 })
 
+// ── Device Codes (IDE ↔ Web auth) ──
+
+export const deviceCodes = pgTable(
+  "device_codes",
+  {
+    id: text("id").primaryKey(),
+    deviceCode: text("device_code").notNull().unique(),
+    userCode: text("user_code").notNull(),
+    status: text("status", { enum: ["pending", "approved", "completed"] })
+      .notNull()
+      .default("pending"),
+    userId: text("user_id").references(() => users.id),
+    workspaceId: text("workspace_id").references(() => workspaces.id),
+    token: text("token"),
+    expiresAt: timestamp("expires_at").notNull(),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("device_codes_user_code_idx").on(table.userCode),
+  ],
+)
+
 // ── Invites ──
 
 export const invites = pgTable(

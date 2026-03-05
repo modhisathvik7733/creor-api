@@ -3,9 +3,10 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { SignJWT } from "jose"
 import { db } from "../db/client.ts"
-import { users, workspaces, billing } from "../db/schema.ts"
+import { users, workspaces, billing, deviceCodes } from "../db/schema.ts"
 import { eq, and } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
+import { requireAuth } from "../middleware/auth.ts"
 
 export const authRoutes = new Hono()
 
@@ -226,6 +227,117 @@ authRoutes.post("/refresh", async (c) => {
   } catch {
     return c.json({ error: "Invalid token" }, 401)
   }
+})
+
+// ── Device Authorization Flow (IDE ↔ Web sign-in) ──
+
+/** POST /device/code — IDE requests a device code to start sign-in */
+authRoutes.post("/device/code", async (c) => {
+  const deviceCode = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("") // 32-char hex secret
+  const userCode = Array.from(crypto.getRandomValues(new Uint8Array(3)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()
+    .slice(0, 6) // 6-char alphanumeric code
+
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000) // 10 minutes
+
+  await db.insert(deviceCodes).values({
+    id: createId("dc"),
+    deviceCode,
+    userCode,
+    status: "pending",
+    expiresAt,
+  })
+
+  const webUrl = process.env.WEB_URL ?? "https://creor.ai"
+
+  return c.json({
+    deviceCode,
+    userCode: `${userCode.slice(0, 3)}-${userCode.slice(3)}`, // format as ABC-DEF
+    verifyUrl: `${webUrl}/auth/device`,
+    expiresIn: 600,
+  })
+})
+
+/** GET /device/status/:deviceCode — IDE polls this to check if user approved */
+authRoutes.get("/device/status/:deviceCode", async (c) => {
+  const { deviceCode } = c.req.param()
+
+  const dc = await db
+    .select()
+    .from(deviceCodes)
+    .where(eq(deviceCodes.deviceCode, deviceCode))
+    .then((rows) => rows[0])
+
+  if (!dc) {
+    return c.json({ status: "expired" })
+  }
+
+  if (dc.expiresAt < new Date()) {
+    return c.json({ status: "expired" })
+  }
+
+  if (dc.status === "approved" && dc.token && dc.userId && dc.workspaceId) {
+    // Mark as completed so it can't be polled again
+    await db
+      .update(deviceCodes)
+      .set({ status: "completed" })
+      .where(eq(deviceCodes.id, dc.id))
+
+    return c.json({
+      status: "approved",
+      token: dc.token,
+      userId: dc.userId,
+      workspaceId: dc.workspaceId,
+    })
+  }
+
+  return c.json({ status: "pending" })
+})
+
+/** POST /device/approve — Web user approves a device code (requires auth) */
+const approveSchema = z.object({
+  userCode: z.string().min(1),
+})
+
+authRoutes.post("/device/approve", requireAuth, zValidator("json", approveSchema), async (c) => {
+  const auth = c.get("auth")
+  const { userCode } = c.req.valid("json")
+
+  // Normalize: remove dash if formatted as ABC-DEF
+  const normalized = userCode.replace(/-/g, "").toUpperCase()
+
+  const dc = await db
+    .select()
+    .from(deviceCodes)
+    .where(and(eq(deviceCodes.userCode, normalized), eq(deviceCodes.status, "pending")))
+    .then((rows) => rows[0])
+
+  if (!dc) {
+    return c.json({ error: "Invalid or expired code" }, 400)
+  }
+
+  if (dc.expiresAt < new Date()) {
+    return c.json({ error: "Code has expired" }, 400)
+  }
+
+  // Generate a JWT for the IDE
+  const token = await createJWT(auth.userId, auth.workspaceId)
+
+  await db
+    .update(deviceCodes)
+    .set({
+      status: "approved",
+      userId: auth.userId,
+      workspaceId: auth.workspaceId,
+      token,
+    })
+    .where(eq(deviceCodes.id, dc.id))
+
+  return c.json({ success: true })
 })
 
 // ── Helpers ──
