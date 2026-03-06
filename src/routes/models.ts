@@ -1,22 +1,55 @@
 import { Hono } from "hono"
-import { GATEWAY_MODELS, type ModelId } from "../lib/models.ts"
+import { db } from "../db/client.ts"
+import { models } from "../db/schema.ts"
+import { eq } from "drizzle-orm"
 
 export const modelRoutes = new Hono()
 
-// ── List available models ──
+// ── List available models (from DB) ──
 
-modelRoutes.get("/", (c) => {
+modelRoutes.get("/", async (c) => {
+  const rows = await db
+    .select()
+    .from(models)
+    .where(eq(models.enabled, true))
+    .orderBy(models.sortOrder)
+
   return c.json({
-    models: Object.values(GATEWAY_MODELS),
+    models: rows.map((m) => ({
+      id: m.id,
+      provider: m.provider,
+      name: m.name,
+      inputCost: Number(m.inputCost),
+      outputCost: Number(m.outputCost),
+      contextWindow: m.contextWindow,
+      maxOutput: m.maxOutput,
+      capabilities: m.capabilities,
+      minPlan: m.minPlan,
+    })),
   })
 })
 
 // ── Get specific model ──
 
-modelRoutes.get("/:modelId{.+}", (c) => {
+modelRoutes.get("/:modelId{.+}", async (c) => {
   const modelId = c.req.param("modelId")
-  const model = GATEWAY_MODELS[modelId as ModelId]
+  const model = await db
+    .select()
+    .from(models)
+    .where(eq(models.id, modelId))
+    .then((r) => r[0])
 
   if (!model) return c.json({ error: "Model not found" }, 404)
-  return c.json(model)
+
+  return c.json({
+    id: model.id,
+    provider: model.provider,
+    name: model.name,
+    inputCost: Number(model.inputCost),
+    outputCost: Number(model.outputCost),
+    contextWindow: model.contextWindow,
+    maxOutput: model.maxOutput,
+    capabilities: model.capabilities,
+    minPlan: model.minPlan,
+  })
 })

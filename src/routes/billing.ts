@@ -2,33 +2,71 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { db } from "../db/client.ts"
-import { billing, subscriptions } from "../db/schema.ts"
-import { eq, and, isNull } from "drizzle-orm"
+import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
+import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription, createRazorpayPlan, verifyPaymentSignature } from "../lib/razorpay.ts"
-import { sql } from "drizzle-orm"
+import { createRazorpayOrder, createRazorpaySubscription, verifyPaymentSignature } from "../lib/razorpay.ts"
+import { createId } from "../lib/id.ts"
+import {
+  MICRO,
+  SYMBOL,
+  microToDisplay,
+  microToSmallest,
+  displayToMicro,
+  isSupportedCurrency,
+} from "../lib/currency.ts"
+import type { SupportedCurrency } from "../lib/currency.ts"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
 billingRoutes.use("*", requireAuth)
 
+// ── Helper: get exchange rates from system_config ──
+
+async function getExchangeRates(): Promise<Record<string, number>> {
+  const row = await db
+    .select()
+    .from(systemConfig)
+    .where(eq(systemConfig.key, "exchange_rates"))
+    .then((r) => r[0])
+  if (row?.value) {
+    return typeof row.value === "string" ? JSON.parse(row.value) : (row.value as Record<string, number>)
+  }
+  return { USD: 1, INR: 85, EUR: 0.92 }
+}
+
 // ── Get billing info ──
 
 billingRoutes.get("/", async (c) => {
   const auth = c.get("auth")
-  const result = await db
+  let result = await db
     .select()
     .from(billing)
     .where(eq(billing.workspaceId, auth.workspaceId))
     .then((rows) => rows[0])
 
-  if (!result) return c.json({ error: "Billing not found" }, 404)
+  // Auto-create billing record if missing (legacy accounts)
+  if (!result) {
+    await db.insert(billing).values({
+      id: createId("bill"),
+      workspaceId: auth.workspaceId,
+    })
+    result = await db
+      .select()
+      .from(billing)
+      .where(eq(billing.workspaceId, auth.workspaceId))
+      .then((rows) => rows[0])
+    if (!result) return c.json({ error: "Failed to initialize billing" }, 500)
+  }
 
-  // Convert micro-paise to INR for display
+  const currency = result.currency as SupportedCurrency
+
   return c.json({
-    balance: result.balance / 1_000_000, // INR
+    balance: microToDisplay(result.balance),
+    currency,
+    symbol: SYMBOL[currency] ?? "$",
     monthlyLimit: result.monthlyLimit,
-    monthlyUsage: (result.monthlyUsage ?? 0) / 1_000_000, // INR
+    monthlyUsage: microToDisplay(result.monthlyUsage ?? 0),
     reloadEnabled: result.reloadEnabled,
     reloadAmount: result.reloadAmount,
     reloadTrigger: result.reloadTrigger,
@@ -36,19 +74,143 @@ billingRoutes.get("/", async (c) => {
   })
 })
 
-// ── Add credits (create Razorpay order) ──
+// ── Quota status (lightweight, for IDE pre-send check) ──
+
+billingRoutes.get("/quota", async (c) => {
+  const auth = c.get("auth")
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((rows) => rows[0])
+
+  if (!bill) {
+    return c.json({ canSend: false, blockReason: "no_billing", warnings: [] }, 200)
+  }
+
+  const currency = bill.currency as SupportedCurrency
+  const exchangeRates = await getExchangeRates()
+  const rate = exchangeRates[currency] ?? 1
+
+  // Subscription check
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(
+      and(
+        eq(subscriptions.workspaceId, auth.workspaceId),
+        isNull(subscriptions.timeDeleted),
+      ),
+    )
+    .then((rows) => rows[0])
+
+  const hasSubscription = !!sub
+
+  // Plan info
+  const plan = sub
+    ? await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
+    : null
+
+  // Monthly usage (lazy-reset aware)
+  const now = new Date()
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  const monthlyUsage =
+    bill.timeMonthlyReset && bill.timeMonthlyReset < monthStart
+      ? 0
+      : (bill.monthlyUsage ?? 0)
+
+  // Monthly limit
+  const planLimitLocal = plan?.monthlyLimit
+    ? Math.round(plan.monthlyLimit * rate)
+    : null
+  const workspaceLimitMicro = bill.monthlyLimit
+    ? bill.monthlyLimit * MICRO
+    : null
+  const effectiveLimit = workspaceLimitMicro ?? planLimitLocal
+
+  // Determine if user can send
+  let canSend = true
+  let blockReason: string | null = null
+  const warnings: string[] = []
+
+  if (!hasSubscription && bill.balance <= 0) {
+    canSend = false
+    blockReason = "credits"
+  } else if (effectiveLimit !== null && monthlyUsage >= effectiveLimit) {
+    canSend = false
+    blockReason = "monthly"
+  }
+
+  // Low balance warning
+  const lowThresholdRow = await db
+    .select()
+    .from(systemConfig)
+    .where(eq(systemConfig.key, "low_balance_threshold_usd"))
+    .then((r) => r[0])
+  const lowThresholdUsd = Number(lowThresholdRow?.value ?? 0.5)
+  const lowThresholdLocal = Math.round(lowThresholdUsd * rate * MICRO)
+  if (!hasSubscription && bill.balance > 0 && bill.balance < lowThresholdLocal) {
+    warnings.push("low_balance")
+  }
+
+  // Monthly approaching
+  if (effectiveLimit !== null && monthlyUsage > 0) {
+    const pct = Math.round((monthlyUsage / effectiveLimit) * 100)
+    if (pct >= 80 && pct < 100) warnings.push("monthly_approaching")
+  }
+
+  const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+
+  const prices = plan?.prices as Record<string, number> | null
+  const planPrice = prices?.[currency] ? (prices[currency] as number) / 100 : null
+
+  return c.json({
+    balance: microToDisplay(bill.balance),
+    currency,
+    symbol: SYMBOL[currency] ?? "$",
+    plan: plan
+      ? { id: plan.id, name: plan.name, price: planPrice }
+      : null,
+    monthly: {
+      current: microToDisplay(monthlyUsage),
+      max: effectiveLimit !== null ? microToDisplay(effectiveLimit) : null,
+      remaining: effectiveLimit !== null ? microToDisplay(Math.max(effectiveLimit - monthlyUsage, 0)) : null,
+      pct: effectiveLimit !== null && effectiveLimit > 0
+        ? Math.round((monthlyUsage / effectiveLimit) * 100)
+        : null,
+      resetsAt: resetDate.toISOString(),
+    },
+    canSend,
+    blockReason,
+    warnings,
+    exchangeRates,
+  })
+})
+
+// ── Add credits (multi-currency Razorpay order) ──
 
 const addCreditsSchema = z.object({
-  amount: z.number().min(100).max(50000), // INR 100 to 50,000
+  amount: z.number().min(1).max(50000), // in display currency units
 })
 
 billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSchema), async (c) => {
   const auth = c.get("auth")
   const { amount } = c.req.valid("json")
 
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((rows) => rows[0])
+
+  if (!bill) return c.json({ error: "No billing record" }, 400)
+
+  const currency = bill.currency as SupportedCurrency
+  const amountSmallest = Math.round(amount * 100) // display units → cents/paise
+
   const order = await createRazorpayOrder({
-    amount: amount * 100, // Razorpay uses paise
-    currency: "INR",
+    amount: amountSmallest,
+    currency,
     receipt: `credits_${auth.workspaceId}_${Date.now()}`,
     notes: {
       workspaceId: auth.workspaceId,
@@ -56,11 +218,24 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
     },
   })
 
+  // Record pending payment
+  await db.insert(payments).values({
+    id: createId("pay"),
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    type: "credits",
+    amountSmallest,
+    currency,
+    razorpayOrderId: order.id,
+    status: "created",
+  })
+
   return c.json({
     orderId: order.id,
     amount,
-    amountPaise: amount * 100,
-    currency: "INR",
+    amountSmallest,
+    currency,
+    symbol: SYMBOL[currency] ?? "$",
     keyId: process.env.RAZORPAY_KEY_ID ?? "",
   })
 })
@@ -87,13 +262,35 @@ billingRoutes.post("/verify-payment", requireAdmin, zValidator("json", verifyPay
     return c.json({ error: "Invalid payment signature" }, 400)
   }
 
-  // Extract amount from the order ID receipt (credits_{workspaceId}_{timestamp})
-  // The webhook will also credit, but we use idempotent logic via the payment ID
-  // For now, we rely on the webhook for actual crediting and just confirm success
+  // Update payment record
+  await db
+    .update(payments)
+    .set({ razorpayPaymentId: razorpay_payment_id, status: "captured" })
+    .where(eq(payments.razorpayOrderId, razorpay_order_id))
+
+  // Credit balance from the payment record
+  const payment = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.razorpayOrderId, razorpay_order_id))
+    .then((r) => r[0])
+
+  if (payment && payment.type === "credits") {
+    // Convert smallest units (cents/paise) → micro-units
+    const creditMicro = payment.amountSmallest * 10_000
+    await db
+      .update(billing)
+      .set({
+        balance: sql`${billing.balance} + ${creditMicro}`,
+        timeUpdated: new Date(),
+      })
+      .where(eq(billing.workspaceId, auth.workspaceId))
+  }
+
   return c.json({ success: true, paymentId: razorpay_payment_id })
 })
 
-// ── Subscribe to Creor Pro ──
+// ── Subscribe (multi-currency) ──
 
 const subscribeSchema = z.object({
   plan: z.enum(["starter", "pro", "team"]),
@@ -102,31 +299,56 @@ const subscribeSchema = z.object({
 
 billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchema), async (c) => {
   const auth = c.get("auth")
-  const { plan, callbackUrl } = c.req.valid("json")
+  const { plan: planId, callbackUrl } = c.req.valid("json")
 
-  const planConfig = getPlanConfig()[plan]
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((rows) => rows[0])
 
-  if (!planConfig.razorpayPlanId) {
-    return c.json({ error: `Razorpay plan ID not configured for "${plan}". Run POST /api/billing/setup-plans first.` }, 500)
+  if (!bill) return c.json({ error: "No billing record" }, 400)
+
+  const currency = bill.currency as SupportedCurrency
+
+  // Get plan from DB
+  const plan = await db
+    .select()
+    .from(plans)
+    .where(eq(plans.id, planId))
+    .then((r) => r[0])
+
+  if (!plan) return c.json({ error: "Plan not found" }, 400)
+
+  // Get Razorpay plan ID for this currency
+  const razorpayPlanIds = plan.razorpayPlanIds as Record<string, string> | null
+  const razorpayPlanId = razorpayPlanIds?.[currency]
+
+  if (!razorpayPlanId) {
+    return c.json({ error: `Razorpay plan not configured for ${planId} in ${currency}` }, 500)
   }
 
   try {
     const subscription = await createRazorpaySubscription({
-      planId: planConfig.razorpayPlanId,
-      totalCount: 12, // 12 months
+      planId: razorpayPlanId,
+      totalCount: 12,
       callbackUrl,
       notes: {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
-        plan,
+        plan: planId,
       },
     })
+
+    const prices = plan.prices as Record<string, number> | null
+    const price = prices?.[currency] ? (prices[currency] as number) / 100 : 0
 
     return c.json({
       subscriptionId: subscription.id,
       shortUrl: subscription.short_url,
-      plan,
-      price: planConfig.price,
+      plan: planId,
+      price,
+      currency,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : "Razorpay subscription creation failed"
@@ -152,6 +374,55 @@ billingRoutes.patch("/limit", requireAdmin, zValidator("json", limitSchema), asy
   return c.json({ success: true })
 })
 
+// ── Switch workspace currency ──
+
+const currencySchema = z.object({
+  currency: z.enum(["USD", "INR", "EUR"]),
+})
+
+billingRoutes.patch("/currency", requireAdmin, zValidator("json", currencySchema), async (c) => {
+  const auth = c.get("auth")
+  const { currency: newCurrency } = c.req.valid("json")
+
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((rows) => rows[0])
+
+  if (!bill) return c.json({ error: "No billing record" }, 400)
+
+  const oldCurrency = bill.currency as SupportedCurrency
+  if (oldCurrency === newCurrency) {
+    return c.json({ success: true, currency: newCurrency })
+  }
+
+  const exchangeRates = await getExchangeRates()
+  const oldRate = exchangeRates[oldCurrency] ?? 1
+  const newRate = exchangeRates[newCurrency] ?? 1
+
+  // Convert balance and monthly usage from old currency to new
+  const conversionFactor = newRate / oldRate
+  const newBalance = Math.round(bill.balance * conversionFactor)
+  const newMonthlyUsage = Math.round((bill.monthlyUsage ?? 0) * conversionFactor)
+
+  await db
+    .update(billing)
+    .set({
+      currency: newCurrency,
+      balance: newBalance,
+      monthlyUsage: newMonthlyUsage,
+      timeUpdated: new Date(),
+    })
+    .where(eq(billing.workspaceId, auth.workspaceId))
+
+  return c.json({
+    success: true,
+    currency: newCurrency,
+    balance: microToDisplay(newBalance),
+  })
+})
+
 // ── Get active subscription ──
 
 billingRoutes.get("/subscription", async (c) => {
@@ -170,81 +441,57 @@ billingRoutes.get("/subscription", async (c) => {
 
   if (!sub) return c.json({ active: false })
 
+  const plan = await db
+    .select()
+    .from(plans)
+    .where(eq(plans.id, sub.plan))
+    .then((r) => r[0])
+
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((r) => r[0])
+
+  const currency = (bill?.currency ?? "USD") as SupportedCurrency
+  const prices = plan?.prices as Record<string, number> | null
+
   return c.json({
     active: true,
     plan: sub.plan,
-    ...getPlanConfig()[sub.plan],
+    planName: plan?.name ?? sub.plan,
+    price: prices?.[currency] ? (prices[currency] as number) / 100 : 0,
+    currency,
+    graceUntil: sub.graceUntil?.toISOString() ?? null,
   })
 })
 
-// ── Setup Razorpay plans (one-time admin endpoint) ──
+// ── Payment history ──
 
-billingRoutes.post("/setup-plans", requireAdmin, async (c) => {
-  const results: Record<string, string> = {}
+billingRoutes.get("/payments", async (c) => {
+  const auth = c.get("auth")
+  const page = Number(c.req.query("page") ?? "1")
+  const limit = Math.min(Number(c.req.query("limit") ?? "20"), 50)
+  const offset = (page - 1) * limit
 
-  for (const [name, config] of Object.entries(getPlanConfig())) {
-    if (config.razorpayPlanId) {
-      results[name] = `already configured: ${config.razorpayPlanId}`
-      continue
-    }
-
-    try {
-      const plan = await createRazorpayPlan({
-        name: `Creor ${name.charAt(0).toUpperCase() + name.slice(1)}`,
-        amount: config.price * 100, // INR to paise
-        currency: "INR",
-        description: `Creor ${name} monthly subscription`,
-      })
-      results[name] = plan.id
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to create plan"
-      results[name] = `error: ${message}`
-    }
-  }
+  const rows = await db
+    .select()
+    .from(payments)
+    .where(eq(payments.workspaceId, auth.workspaceId))
+    .orderBy(desc(payments.timeCreated))
+    .limit(limit)
+    .offset(offset)
 
   return c.json({
-    message: "Set these plan IDs as Supabase secrets (RAZORPAY_PLAN_STARTER, RAZORPAY_PLAN_PRO, RAZORPAY_PLAN_TEAM)",
-    plans: results,
+    payments: rows.map((p) => ({
+      id: p.id,
+      type: p.type,
+      amount: p.amountSmallest / 100, // display units
+      currency: p.currency,
+      status: p.status,
+      timeCreated: p.timeCreated.toISOString(),
+    })),
+    page,
+    limit,
   })
 })
-
-// ── Plan configuration (INR pricing) ──
-// NOTE: Must be a function — process.env shim isn't ready at module scope in Deno edge functions
-
-type PlanConfig = {
-  price: number
-  currency: string
-  razorpayPlanId: string
-  weeklyLimit: number
-  rollingWindow: number
-  rollingLimit: number
-}
-
-function getPlanConfig(): Record<string, PlanConfig> {
-  return {
-    starter: {
-      price: 499,
-      currency: "INR",
-      razorpayPlanId: process.env.RAZORPAY_PLAN_STARTER ?? "",
-      weeklyLimit: 50_000_000, // micro-paise
-      rollingWindow: 24, // hours
-      rollingLimit: 20_000_000,
-    },
-    pro: {
-      price: 1999,
-      currency: "INR",
-      razorpayPlanId: process.env.RAZORPAY_PLAN_PRO ?? "",
-      weeklyLimit: 200_000_000,
-      rollingWindow: 24,
-      rollingLimit: 80_000_000,
-    },
-    team: {
-      price: 4999,
-      currency: "INR",
-      razorpayPlanId: process.env.RAZORPAY_PLAN_TEAM ?? "",
-      weeklyLimit: 500_000_000,
-      rollingWindow: 24,
-      rollingLimit: 200_000_000,
-    },
-  }
-}

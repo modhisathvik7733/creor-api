@@ -11,6 +11,7 @@ import { shareRoutes } from "./routes/share.ts"
 import { gatewayRoutes } from "./routes/gateway.ts"
 import { webhookRoutes } from "./routes/webhooks.ts"
 import { userRoutes } from "./routes/user.ts"
+import { adminRoutes } from "./routes/admin.ts"
 
 const app = new Hono()
 
@@ -19,7 +20,15 @@ app.use("*", logger())
 app.use(
   "*",
   cors({
-    origin: (process.env.CORS_ORIGIN ?? "http://localhost:3000").split(","),
+    origin: (origin) => {
+      // Allow Creor IDE (Electron renderer) origin
+      if (origin === "vscode-file://vscode-app") {
+        return origin
+      }
+      // Allow configured origins (web dashboard, etc.)
+      const allowed = (process.env.CORS_ORIGIN ?? "http://localhost:3000").split(",")
+      return allowed.includes(origin) ? origin : allowed[0]
+    },
     credentials: true,
     allowHeaders: ["Content-Type", "Authorization", "X-Creor-Request"],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -41,6 +50,7 @@ app.route("/api/models", modelRoutes)
 app.route("/api/usage", usageRoutes)
 app.route("/api/share", shareRoutes)
 app.route("/api/webhooks", webhookRoutes)
+app.route("/api/admin", adminRoutes)
 
 // LLM Gateway (separate path for AI SDK compatibility)
 app.route("/v1", gatewayRoutes)

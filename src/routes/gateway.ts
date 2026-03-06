@@ -1,29 +1,12 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { keys, billing, usage, subscriptions } from "../db/schema.ts"
+import { keys, billing, usage, subscriptions, plans } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
-import { getModelCost } from "../lib/models.ts"
+import { MICRO, microToDisplay, usdToWorkspaceMicro } from "../lib/currency.ts"
+import type { SupportedCurrency } from "../lib/currency.ts"
 
 export const gatewayRoutes = new Hono()
-
-// ── In-memory rate limiting ──
-
-const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minute
-const RATE_LIMIT_MAX = 60 // requests per minute per key
-
-const rateLimitMap = new Map<string, { count: number; windowStart: number }>()
-
-function checkRateLimit(keyId: string): boolean {
-  const now = Date.now()
-  const entry = rateLimitMap.get(keyId)
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitMap.set(keyId, { count: 1, windowStart: now })
-    return true
-  }
-  entry.count++
-  return entry.count <= RATE_LIMIT_MAX
-}
 
 /**
  * Creor Gateway — LLM proxy endpoint.
@@ -65,7 +48,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     return c.json({ error: { type: "BillingError", message: "No billing record found" } }, 402)
   }
 
-  // Check subscription or balance
+  // Check subscription
   const sub = await db
     .select()
     .from(subscriptions)
@@ -79,55 +62,72 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     .then((rows) => rows[0])
 
   const hasSubscription = !!sub
-  const hasBalance = bill.balance > 0
 
-  if (!hasSubscription && !hasBalance) {
+  // Balance check (credit users only)
+  if (!hasSubscription && bill.balance <= 0) {
     return c.json(
       {
         error: {
           type: "CreditsError",
-          message: "Insufficient balance. Add credits at https://creor.ai/dashboard/billing",
+          message: "Insufficient credits. Add credits at https://creor.ai/dashboard/billing",
+          balance: 0,
+          currency: bill.currency,
         },
       },
       402,
     )
   }
 
-  // Rate limit check
-  if (!checkRateLimit(keyData.id)) {
-    return c.json(
-      { error: { type: "RateLimitError", message: "Too many requests. Limit: 60/minute." } },
-      429,
-    )
-  }
+  // Monthly limit check using pre-aggregated counter
+  const now = new Date()
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  const monthlyUsage =
+    bill.timeMonthlyReset && bill.timeMonthlyReset < monthStart
+      ? 0
+      : (bill.monthlyUsage ?? 0)
 
-  // Monthly limit check (live query from usage table)
-  if (bill.monthlyLimit && bill.monthlyLimit > 0) {
-    const monthStart = new Date()
-    monthStart.setDate(1)
-    monthStart.setHours(0, 0, 0, 0)
-    const [{ total }] = await db
-      .select({ total: sql<number>`COALESCE(SUM(${usage.cost}), 0)` })
-      .from(usage)
-      .where(
-        and(
-          eq(usage.workspaceId, keyData.workspaceId),
-          sql`${usage.timeCreated} >= ${monthStart.toISOString()}`,
-        ),
-      )
-    // monthlyLimit is in INR, total is in micro-paise → convert limit to micro-paise
-    const limitMicroPaise = bill.monthlyLimit * 1_000_000
-    if (total >= limitMicroPaise) {
-      return c.json(
-        {
-          error: {
-            type: "LimitError",
-            message: "Monthly usage limit reached. Increase your limit at https://creor.ai/dashboard/billing",
-          },
+  // Load plan to get monthly limit
+  const plan = sub
+    ? await db
+        .select()
+        .from(plans)
+        .where(eq(plans.id, sub.plan))
+        .then((r) => r[0])
+    : null
+
+  // Fetch exchange rates for currency conversion
+  const exchangeRates = await getExchangeRates()
+  const currency = bill.currency as SupportedCurrency
+  const rate = exchangeRates[currency] ?? 1
+
+  // Plan limit is in USD micro-units → convert to workspace currency
+  const planLimitLocal = plan?.monthlyLimit
+    ? Math.round(plan.monthlyLimit * rate)
+    : null
+
+  // Workspace override (legacy: monthlyLimit is in INR units → convert to micro-units)
+  const workspaceLimitMicro = bill.monthlyLimit
+    ? bill.monthlyLimit * MICRO
+    : null
+
+  const effectiveLimit = workspaceLimitMicro ?? planLimitLocal
+
+  if (effectiveLimit !== null && monthlyUsage >= effectiveLimit) {
+    const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+    return c.json(
+      {
+        error: {
+          type: "LimitError",
+          limit: "monthly",
+          current: microToDisplay(monthlyUsage),
+          max: microToDisplay(effectiveLimit),
+          currency: bill.currency,
+          resetsAt: resetDate.toISOString(),
+          message: `Monthly usage limit reached (${microToDisplay(monthlyUsage).toFixed(2)} / ${microToDisplay(effectiveLimit).toFixed(2)} ${bill.currency}). Resets ${resetDate.toISOString()}.`,
         },
-        402,
-      )
-    }
+      },
+      402,
+    )
   }
 
   // Parse request
@@ -137,6 +137,33 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
   if (!model) {
     return c.json({ error: { type: "ModelError", message: "Model is required" } }, 400)
+  }
+
+  // Look up model pricing from materialized view
+  const config = await db
+    .execute(sql`SELECT * FROM gateway_config WHERE model_id = ${model}`)
+    .then((r) => r[0])
+
+  let inputCost: number
+  let outputCost: number
+
+  if (config) {
+    if (!config.enabled) {
+      return c.json(
+        { error: { type: "ModelError", message: "Model temporarily unavailable" } },
+        503,
+      )
+    }
+    inputCost = Number(config.input_cost)
+    outputCost = Number(config.output_cost)
+  } else {
+    // Fallback pricing for unknown models
+    const fallback = await db
+      .execute(sql`SELECT fallback_input, fallback_output FROM gateway_config LIMIT 1`)
+      .then((r) => r[0])
+    inputCost = Number(fallback?.fallback_input ?? 0.003)
+    outputCost = Number(fallback?.fallback_output ?? 0.015)
+    console.warn(`Unknown model ${model} — using fallback pricing`)
   }
 
   // Route to upstream provider
@@ -156,8 +183,6 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   upstreamHeaders.set("Content-Type", "application/json")
   providerConfig.setAuth(upstreamHeaders)
 
-  const startTime = Date.now()
-
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method: "POST",
@@ -173,31 +198,43 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       })
     }
 
-    // Track usage (async, non-blocking)
-    if (!isStream) {
-      const responseClone = upstreamRes.clone()
-      const responseJson = await responseClone.json() as {
-        usage?: { prompt_tokens?: number; completion_tokens?: number }
-      }
-      trackUsageAsync(keyData, model, providerConfig.provider, responseJson.usage, hasSubscription)
+    const costCtx: CostContext = {
+      keyData,
+      model,
+      provider: providerConfig.provider,
+      inputCost,
+      outputCost,
+      exchangeRates,
+      currency,
+      hasSubscription,
     }
 
     // Return response (stream-through for SSE)
     const responseHeaders = new Headers()
-    responseHeaders.set("Content-Type", upstreamRes.headers.get("Content-Type") ?? "application/json")
+    responseHeaders.set(
+      "Content-Type",
+      upstreamRes.headers.get("Content-Type") ?? "application/json",
+    )
+
     if (isStream) {
       responseHeaders.set("Cache-Control", "no-cache")
       responseHeaders.set("Connection", "keep-alive")
 
-      // For streaming, track usage from the stream's final chunk
       const { readable, writable } = new TransformStream()
-      trackStreamUsage(upstreamRes.body!, writable, keyData, model, providerConfig.provider, hasSubscription)
+      trackStreamUsage(upstreamRes.body!, writable, costCtx)
 
       return new Response(readable, {
         status: upstreamRes.status,
         headers: responseHeaders,
       })
     }
+
+    // Non-streaming: read response, track usage
+    const responseClone = upstreamRes.clone()
+    const responseJson = (await responseClone.json()) as {
+      usage?: { prompt_tokens?: number; completion_tokens?: number }
+    }
+    trackUsageAsync(costCtx, responseJson.usage)
 
     return new Response(upstreamRes.body, {
       status: upstreamRes.status,
@@ -222,7 +259,6 @@ interface ProviderConfig {
 }
 
 function getProviderConfig(model: string): ProviderConfig | null {
-  // anthropic/* models
   if (model.startsWith("anthropic/")) {
     const upstreamModel = model.replace("anthropic/", "")
     return {
@@ -237,7 +273,6 @@ function getProviderConfig(model: string): ProviderConfig | null {
     }
   }
 
-  // openai/* models
   if (model.startsWith("openai/")) {
     const upstreamModel = model.replace("openai/", "")
     return {
@@ -249,7 +284,6 @@ function getProviderConfig(model: string): ProviderConfig | null {
     }
   }
 
-  // google/* models
   if (model.startsWith("google/")) {
     const upstreamModel = model.replace("google/", "")
     return {
@@ -266,42 +300,72 @@ function getProviderConfig(model: string): ProviderConfig | null {
 
 // ── Usage tracking ──
 
+interface CostContext {
+  keyData: { id: string; workspaceId: string }
+  model: string
+  provider: string
+  inputCost: number // USD per 1K tokens
+  outputCost: number // USD per 1K tokens
+  exchangeRates: Record<string, number>
+  currency: SupportedCurrency
+  hasSubscription: boolean
+}
+
+/** Get exchange rates from system_config (cached in materialized view) */
+async function getExchangeRates(): Promise<Record<string, number>> {
+  const row = await db
+    .execute(sql`SELECT exchange_rates FROM gateway_config LIMIT 1`)
+    .then((r) => r[0])
+  if (row?.exchange_rates) {
+    return typeof row.exchange_rates === "string"
+      ? JSON.parse(row.exchange_rates) as Record<string, number>
+      : row.exchange_rates as Record<string, number>
+  }
+  // Hardcoded fallback (should never happen if migrations ran)
+  return { USD: 1, INR: 85, EUR: 0.92 }
+}
+
 async function trackUsageAsync(
-  keyData: { id: string; workspaceId: string },
-  model: string,
-  provider: string,
+  ctx: CostContext,
   usageData: { prompt_tokens?: number; completion_tokens?: number } | undefined,
-  hasSubscription: boolean,
+  estimatedText?: string,
 ) {
-  if (!usageData) return
+  let inputTokens = usageData?.prompt_tokens ?? 0
+  let outputTokens = usageData?.completion_tokens ?? 0
 
-  const inputTokens = usageData.prompt_tokens ?? 0
-  const outputTokens = usageData.completion_tokens ?? 0
+  // Google streaming fallback: estimate from text length
+  if (!usageData && estimatedText) {
+    outputTokens = Math.ceil(estimatedText.length / 4)
+    console.warn(`Estimated ${outputTokens} output tokens for ${ctx.model} (no usage data)`)
+  }
 
-  // Per-model cost (USD per 1K tokens) → micro-paise
-  const modelCost = getModelCost(model)
-  const costUSD = (inputTokens * modelCost.input + outputTokens * modelCost.output) / 1_000
-  const costMicroPaise = Math.round(costUSD * 85 * 1_000_000) // USD → INR → micro-paise
+  if (inputTokens === 0 && outputTokens === 0) return
+
+  // Cost in USD
+  const costUSD = (inputTokens * ctx.inputCost + outputTokens * ctx.outputCost) / 1_000
+  const costUsdMicro = Math.round(costUSD * MICRO)
+
+  // Cost in workspace currency (micro-units)
+  const costMicro = usdToWorkspaceMicro(costUSD, ctx.exchangeRates, ctx.currency)
 
   try {
+    // Atomic: increment monthly counter + deduct balance
+    await db.execute(
+      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.hasSubscription})`,
+    )
+
+    // Insert usage row
     await db.insert(usage).values({
       id: createId("usg"),
-      workspaceId: keyData.workspaceId,
-      keyId: keyData.id,
-      model,
-      provider,
+      workspaceId: ctx.keyData.workspaceId,
+      keyId: ctx.keyData.id,
+      model: ctx.model,
+      provider: ctx.provider,
       inputTokens,
       outputTokens,
-      cost: costMicroPaise,
+      cost: costMicro,
+      costUsd: costUsdMicro,
     })
-
-    // Deduct from balance (skip for subscription users)
-    if (!hasSubscription && costMicroPaise > 0) {
-      await db
-        .update(billing)
-        .set({ balance: sql`${billing.balance} - ${costMicroPaise}` })
-        .where(eq(billing.workspaceId, keyData.workspaceId))
-    }
   } catch (err) {
     console.error("Failed to track usage:", err)
   }
@@ -310,16 +374,14 @@ async function trackUsageAsync(
 async function trackStreamUsage(
   upstream: ReadableStream<Uint8Array>,
   writable: WritableStream<Uint8Array>,
-  keyData: { id: string; workspaceId: string },
-  model: string,
-  provider: string,
-  hasSubscription: boolean,
+  ctx: CostContext,
 ) {
   const reader = upstream.getReader()
   const writer = writable.getWriter()
   const decoder = new TextDecoder()
 
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
+  let accumulatedText = ""
 
   try {
     while (true) {
@@ -335,6 +397,11 @@ async function trackStreamUsage(
           try {
             const chunk = JSON.parse(line.slice(6))
             if (chunk.usage) lastUsage = chunk.usage
+            // Accumulate text for Google token estimation
+            const delta =
+              chunk.choices?.[0]?.delta?.content ??
+              chunk.candidates?.[0]?.content?.parts?.[0]?.text
+            if (delta) accumulatedText += delta
           } catch {
             // ignore parse errors
           }
@@ -343,9 +410,7 @@ async function trackStreamUsage(
     }
   } finally {
     await writer.close()
-    // Track usage from the final chunk
-    if (lastUsage) {
-      trackUsageAsync(keyData, model, provider, lastUsage, hasSubscription)
-    }
+    // Track with usage data, or estimate from accumulated text
+    trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
   }
 }

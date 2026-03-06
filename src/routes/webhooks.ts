@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { billing, subscriptions, webhookEvents } from "../db/schema.ts"
+import { billing, subscriptions, webhookEvents, payments } from "../db/schema.ts"
 import { eq, sql } from "drizzle-orm"
 import { verifyRazorpaySignature } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
@@ -48,17 +48,35 @@ webhookRoutes.post("/razorpay", async (c) => {
     case "payment.captured": {
       const payment = event.payload.payment.entity
       const workspaceId = payment.notes?.workspaceId
-      const type = payment.notes?.type
+      const type = payment.notes?.type ?? "credits"
 
       if (!workspaceId) break
 
+      // Record payment history (idempotent via unique razorpay_payment_id)
+      try {
+        await db.insert(payments).values({
+          id: createId("pay"),
+          workspaceId,
+          userId: payment.notes?.userId ?? null,
+          type: type as "credits" | "subscription",
+          amountSmallest: payment.amount, // already in smallest unit (paise/cents)
+          currency: payment.currency,
+          razorpayOrderId: payment.notes?.orderId ?? null,
+          razorpayPaymentId: payment.id,
+          status: "captured",
+          metadata: { notes: payment.notes },
+        })
+      } catch {
+        // Unique constraint on razorpay_payment_id = already recorded
+      }
+
       if (type === "credits") {
-        // Add credits: amount is in paise, convert to micro-paise for storage
-        const microPaise = payment.amount * 10000 // paise → micro-paise
+        // Convert smallest units (cents/paise) to micro-units
+        const creditMicro = payment.amount * 10_000
         await db
           .update(billing)
           .set({
-            balance: sql`${billing.balance} + ${microPaise}`,
+            balance: sql`${billing.balance} + ${creditMicro}`,
             timeUpdated: new Date(),
           })
           .where(eq(billing.workspaceId, workspaceId))

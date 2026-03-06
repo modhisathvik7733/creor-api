@@ -6,6 +6,7 @@ import {
   bigint,
   boolean,
   jsonb,
+  numeric,
   uniqueIndex,
   index,
 } from "drizzle-orm/pg-core"
@@ -105,15 +106,17 @@ export const billing = pgTable("billing", {
     .notNull()
     .references(() => workspaces.id)
     .unique(),
-  balance: bigint("balance", { mode: "number" }).notNull().default(0), // micro-paise
-  monthlyLimit: integer("monthly_limit"), // in INR
-  monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0),
+  balance: bigint("balance", { mode: "number" }).notNull().default(0), // micro-units (1 currency unit = 1,000,000)
+  currency: text("currency").notNull().default("INR"), // USD | INR | EUR
+  monthlyLimit: integer("monthly_limit"), // legacy INR — use plans.monthly_limit instead
+  monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // micro-units
+  timeMonthlyReset: timestamp("time_monthly_reset").defaultNow(), // lazy reset at month boundary
   timeMonthlyUsageUpdated: timestamp("time_monthly_usage_updated"),
   razorpayCustomerId: text("razorpay_customer_id"),
   razorpaySubscriptionId: text("razorpay_subscription_id"),
   reloadEnabled: boolean("reload_enabled").default(false),
-  reloadAmount: integer("reload_amount").default(500), // INR
-  reloadTrigger: integer("reload_trigger").default(100), // INR threshold
+  reloadAmount: integer("reload_amount").default(500),
+  reloadTrigger: integer("reload_trigger").default(100),
   timeReloadLockedTill: timestamp("time_reload_locked_till"),
   timeCreated: timestamp("time_created").defaultNow().notNull(),
   timeUpdated: timestamp("time_updated").defaultNow().notNull(),
@@ -144,6 +147,7 @@ export const subscriptions = pgTable(
     fixedUsage: bigint("fixed_usage", { mode: "number" }).default(0),
     timeRollingUpdated: timestamp("time_rolling_updated"),
     timeFixedUpdated: timestamp("time_fixed_updated"),
+    graceUntil: timestamp("grace_until"),
     timeCreated: timestamp("time_created").defaultNow().notNull(),
     timeDeleted: timestamp("time_deleted"),
   },
@@ -168,12 +172,14 @@ export const usage = pgTable(
     outputTokens: integer("output_tokens").notNull().default(0),
     reasoningTokens: integer("reasoning_tokens"),
     cacheReadTokens: integer("cache_read_tokens"),
-    cost: bigint("cost", { mode: "number" }).notNull().default(0), // micro-paise
+    cost: bigint("cost", { mode: "number" }).notNull().default(0), // micro-units (workspace currency)
+    costUsd: bigint("cost_usd", { mode: "number" }), // micro-units (always USD, for analytics)
     timeCreated: timestamp("time_created").defaultNow().notNull(),
   },
   (table) => [
     index("usage_workspace_idx").on(table.workspaceId),
     index("usage_time_idx").on(table.timeCreated),
+    index("idx_usage_workspace_time").on(table.workspaceId, table.timeCreated),
   ],
 )
 
@@ -224,6 +230,7 @@ export const providerCredentials = pgTable(
 export const shares = pgTable("shares", {
   id: text("id").primaryKey(),
   workspaceId: text("workspace_id").references(() => workspaces.id),
+  secret: text("secret"),
   data: jsonb("data").notNull(), // session + messages + parts JSON
   timeCreated: timestamp("time_created").defaultNow().notNull(),
   timeDeleted: timestamp("time_deleted"),
@@ -259,6 +266,87 @@ export const deviceCodes = pgTable(
     uniqueIndex("device_codes_user_code_idx").on(table.userCode),
   ],
 )
+
+// ── Model Catalog (server-driven pricing) ──
+
+export const models = pgTable("models", {
+  id: text("id").primaryKey(),
+  provider: text("provider").notNull(),
+  name: text("name").notNull(),
+  inputCost: numeric("input_cost", { precision: 10, scale: 6 }).notNull(), // USD per 1K tokens
+  outputCost: numeric("output_cost", { precision: 10, scale: 6 }).notNull(),
+  contextWindow: integer("context_window").notNull().default(200000),
+  maxOutput: integer("max_output"),
+  capabilities: jsonb("capabilities").default([]),
+  enabled: boolean("enabled").notNull().default(true),
+  minPlan: text("min_plan").default("free"),
+  sortOrder: integer("sort_order").default(0),
+  timeCreated: timestamp("time_created").defaultNow().notNull(),
+  timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+})
+
+// ── Plan Catalog ──
+
+export const plans = pgTable("plans", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  prices: jsonb("prices").notNull().default({}), // {"USD": 999, "INR": 49900, "EUR": 549} smallest unit
+  monthlyLimit: bigint("monthly_limit", { mode: "number" }), // micro-units (USD-equivalent)
+  onboardingCredits: bigint("onboarding_credits", { mode: "number" }).default(0),
+  features: jsonb("features").default([]),
+  razorpayPlanIds: jsonb("razorpay_plan_ids").default({}), // {"USD": "plan_xxx", "INR": "plan_yyy"}
+  enabled: boolean("enabled").notNull().default(true),
+  sortOrder: integer("sort_order").default(0),
+  timeCreated: timestamp("time_created").defaultNow().notNull(),
+  timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+})
+
+// ── System Config (key-value) ──
+
+export const systemConfig = pgTable("system_config", {
+  key: text("key").primaryKey(),
+  value: jsonb("value").notNull(),
+  description: text("description"),
+  timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+})
+
+// ── Payments ──
+
+export const payments = pgTable(
+  "payments",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+    type: text("type", { enum: ["credits", "subscription", "onboarding", "refund"] }).notNull(),
+    amountSmallest: integer("amount_smallest").notNull(), // cents/paise
+    currency: text("currency").notNull().default("USD"),
+    razorpayOrderId: text("razorpay_order_id"),
+    razorpayPaymentId: text("razorpay_payment_id").unique(),
+    status: text("status", { enum: ["created", "captured", "failed", "refunded"] })
+      .notNull()
+      .default("created"),
+    metadata: jsonb("metadata"),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+  },
+  (table) => [
+    index("payments_workspace_idx").on(table.workspaceId),
+    index("payments_razorpay_order_idx").on(table.razorpayOrderId),
+  ],
+)
+
+export const paymentsRelations = relations(payments, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [payments.workspaceId],
+    references: [workspaces.id],
+  }),
+  user: one(users, {
+    fields: [payments.userId],
+    references: [users.id],
+  }),
+}))
 
 // ── Invites ──
 
