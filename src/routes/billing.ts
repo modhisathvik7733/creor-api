@@ -408,6 +408,12 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
   }).onConflictDoNothing()
 
   // Update billing record
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((r) => r[0])
+
   await db
     .update(billing)
     .set({
@@ -415,6 +421,29 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
       timeUpdated: new Date(),
     })
     .where(eq(billing.workspaceId, auth.workspaceId))
+
+  // Record subscription payment in payment history
+  const plan = await db.select().from(plans).where(eq(plans.id, planId)).then((r) => r[0])
+  if (plan && bill) {
+    const currency = (bill.currency ?? "INR") as SupportedCurrency
+    const prices = plan.prices as Record<string, number> | null
+    const amountSmallest = prices?.[currency] ?? prices?.["INR"] ?? 0
+    try {
+      await db.insert(payments).values({
+        id: createId("pay"),
+        workspaceId: auth.workspaceId,
+        userId: auth.userId,
+        type: "subscription",
+        amountSmallest,
+        currency,
+        razorpayPaymentId: `sub_payment_${subscriptionId}`,
+        status: "captured",
+        metadata: { subscriptionId, plan: planId },
+      })
+    } catch {
+      // Unique constraint on razorpay_payment_id — already recorded
+    }
+  }
 
   return c.json({ success: true, status: "activated", plan: planId })
 })
