@@ -91,10 +91,23 @@ export async function createRazorpaySubscription(params: {
       body: JSON.stringify({
         plan_id: params.planId,
         total_count: params.totalCount,
+        ...(params.callbackUrl && { notify_info: { notify_url: params.callbackUrl } }),
         notes: params.notes,
       }),
     },
   )
+}
+
+/** Fetch a subscription's current status from Razorpay */
+export async function fetchRazorpaySubscription(subscriptionId: string) {
+  return rzFetch<{
+    id: string
+    plan_id: string
+    status: string
+    notes: Record<string, string>
+    current_start: number | null
+    current_end: number | null
+  }>(`/subscriptions/${subscriptionId}`)
 }
 
 /** Cancel a subscription */

@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription, verifyPaymentSignature } from "../lib/razorpay.ts"
+import { createRazorpayOrder, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
 import {
   MICRO,
@@ -354,6 +354,71 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     const message = err instanceof Error ? err.message : "Razorpay subscription creation failed"
     return c.json({ error: message }, 500)
   }
+})
+
+// ── Activate subscription (callback-based, doesn't depend on webhook) ──
+
+const activateSubSchema = z.object({
+  subscriptionId: z.string().min(1),
+})
+
+billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", activateSubSchema), async (c) => {
+  const auth = c.get("auth")
+  const { subscriptionId } = c.req.valid("json")
+
+  // Check if already activated
+  const existing = await db
+    .select()
+    .from(subscriptions)
+    .where(eq(subscriptions.razorpaySubscriptionId, subscriptionId))
+    .then((r) => r[0])
+
+  if (existing && !existing.timeDeleted) {
+    return c.json({ success: true, status: "already_active" })
+  }
+
+  // Verify with Razorpay that the subscription is actually active
+  let rzSub: { id: string; plan_id: string; status: string; notes: Record<string, string> }
+  try {
+    rzSub = await fetchRazorpaySubscription(subscriptionId)
+  } catch {
+    return c.json({ error: "Could not verify subscription with Razorpay" }, 400)
+  }
+
+  if (rzSub.status !== "active" && rzSub.status !== "authenticated") {
+    return c.json({ error: `Subscription status is "${rzSub.status}", not active` }, 400)
+  }
+
+  // Verify this subscription belongs to this workspace
+  const workspaceId = rzSub.notes?.workspaceId
+  if (workspaceId && workspaceId !== auth.workspaceId) {
+    return c.json({ error: "Subscription does not belong to this workspace" }, 403)
+  }
+
+  const planId = rzSub.notes?.plan as string | undefined
+  if (!planId) {
+    return c.json({ error: "Subscription missing plan info" }, 400)
+  }
+
+  // Create subscription record
+  await db.insert(subscriptions).values({
+    id: createId("sub"),
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    plan: planId,
+    razorpaySubscriptionId: subscriptionId,
+  }).onConflictDoNothing()
+
+  // Update billing record
+  await db
+    .update(billing)
+    .set({
+      razorpaySubscriptionId: subscriptionId,
+      timeUpdated: new Date(),
+    })
+    .where(eq(billing.workspaceId, auth.workspaceId))
+
+  return c.json({ success: true, status: "activated", plan: planId })
 })
 
 // ── Update monthly limit ──
