@@ -78,7 +78,6 @@ export async function createRazorpayPlan(params: {
 export async function createRazorpaySubscription(params: {
   planId: string
   totalCount: number
-  callbackUrl?: string
   notes?: Record<string, string>
 }) {
   if (!params.planId) {
@@ -91,7 +90,6 @@ export async function createRazorpaySubscription(params: {
       body: JSON.stringify({
         plan_id: params.planId,
         total_count: params.totalCount,
-        ...(params.callbackUrl && { callback_url: params.callbackUrl }),
         notes: params.notes,
       }),
     },

@@ -294,12 +294,11 @@ billingRoutes.post("/verify-payment", requireAdmin, zValidator("json", verifyPay
 
 const subscribeSchema = z.object({
   plan: z.enum(["starter", "pro", "team"]),
-  callbackUrl: z.string().url().optional(),
 })
 
 billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchema), async (c) => {
   const auth = c.get("auth")
-  const { plan: planId, callbackUrl } = c.req.valid("json")
+  const { plan: planId } = c.req.valid("json")
 
   const bill = await db
     .select()
@@ -332,7 +331,6 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     const subscription = await createRazorpaySubscription({
       planId: razorpayPlanId,
       totalCount: 12,
-      callbackUrl,
       notes: {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
@@ -345,10 +343,10 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
     return c.json({
       subscriptionId: subscription.id,
-      shortUrl: subscription.short_url,
       plan: planId,
       price,
       currency,
+      keyId: process.env.RAZORPAY_KEY_ID ?? "",
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : "Razorpay subscription creation failed"
