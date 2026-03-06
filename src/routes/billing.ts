@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature, updateRazorpaySubscription, cancelRazorpaySubscriptionAtCycleEnd } from "../lib/razorpay.ts"
+import { createRazorpayOrder, createRazorpayPlan, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature, updateRazorpaySubscription, cancelRazorpaySubscriptionAtCycleEnd } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
 import {
   MICRO,
@@ -333,12 +333,32 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
   if (!plan) return c.json({ error: "Plan not found" }, 400)
 
-  // Get Razorpay plan ID for this currency
+  // Get Razorpay plan ID for this currency (auto-create if missing)
   const razorpayPlanIds = plan.razorpayPlanIds as Record<string, string> | null
-  const razorpayPlanId = razorpayPlanIds?.[currency]
+  let razorpayPlanId = razorpayPlanIds?.[currency]
 
   if (!razorpayPlanId) {
-    return c.json({ error: `Razorpay plan not configured for ${planId} in ${currency}` }, 500)
+    const prices = plan.prices as Record<string, number> | null
+    const priceSmallest = prices?.[currency]
+    if (!priceSmallest) {
+      return c.json({ error: `Plan ${planId} not available in ${currency}` }, 400)
+    }
+    try {
+      const rzPlan = await createRazorpayPlan({
+        name: `Creor ${plan.name} (${currency})`,
+        amount: priceSmallest,
+        currency,
+        description: `Creor ${plan.name} plan`,
+        period: "monthly",
+      })
+      razorpayPlanId = rzPlan.id
+      await db.update(plans).set({
+        razorpayPlanIds: { ...(razorpayPlanIds ?? {}), [currency]: rzPlan.id },
+        timeUpdated: new Date(),
+      }).where(eq(plans.id, planId))
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "Failed to create payment plan" }, 500)
+    }
   }
 
   try {
@@ -610,8 +630,31 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
 
   const currency = (bill?.currency ?? "INR") as SupportedCurrency
   const rzPlanIds = newPlan.razorpayPlanIds as Record<string, string> | null
-  const rzPlanId = rzPlanIds?.[currency]
-  if (!rzPlanId) return c.json({ error: `Plan not available in ${currency}` }, 400)
+  let rzPlanId = rzPlanIds?.[currency]
+
+  if (!rzPlanId) {
+    const prices = newPlan.prices as Record<string, number> | null
+    const priceSmallest = prices?.[currency]
+    if (!priceSmallest) {
+      return c.json({ error: `Plan ${newPlanId} not available in ${currency}` }, 400)
+    }
+    try {
+      const rzPlan = await createRazorpayPlan({
+        name: `Creor ${newPlan.name} (${currency})`,
+        amount: priceSmallest,
+        currency,
+        description: `Creor ${newPlan.name} plan`,
+        period: "monthly",
+      })
+      rzPlanId = rzPlan.id
+      await db.update(plans).set({
+        razorpayPlanIds: { ...(rzPlanIds ?? {}), [currency]: rzPlan.id },
+        timeUpdated: new Date(),
+      }).where(eq(plans.id, newPlanId))
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "Failed to create payment plan" }, 500)
+    }
+  }
 
   // Determine direction
   const currentPlan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
