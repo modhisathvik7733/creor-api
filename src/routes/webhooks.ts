@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { billing, subscriptions, webhookEvents, payments } from "../db/schema.ts"
+import { billing, subscriptions, webhookEvents, payments, plans } from "../db/schema.ts"
 import { eq, sql } from "drizzle-orm"
 import { verifyRazorpaySignature } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
@@ -108,6 +108,40 @@ webhookRoutes.post("/razorpay", async (c) => {
         })
         .where(eq(billing.workspaceId, workspaceId))
 
+      break
+    }
+
+    case "subscription.updated": {
+      // Handles plan changes (e.g., downgrade taking effect at cycle end)
+      const updatedSub = event.payload.subscription.entity
+      const newRzPlanId = updatedSub.plan_id
+
+      // Find our subscription by Razorpay ID
+      const existingSub = await db
+        .select()
+        .from(subscriptions)
+        .where(eq(subscriptions.razorpaySubscriptionId, updatedSub.id))
+        .then((r) => r[0])
+
+      if (existingSub && newRzPlanId) {
+        // Map Razorpay plan ID back to our plan ID
+        const allPlans = await db.select().from(plans)
+        const matchedPlan = allPlans.find((p) => {
+          const rzIds = p.razorpayPlanIds as Record<string, string> | null
+          return rzIds && Object.values(rzIds).includes(newRzPlanId)
+        })
+
+        if (matchedPlan) {
+          await db
+            .update(subscriptions)
+            .set({
+              plan: matchedPlan.id as "starter" | "pro" | "team",
+              pendingPlan: null,
+              pendingPlanEffectiveAt: null,
+            })
+            .where(eq(subscriptions.id, existingSub.id))
+        }
+      }
       break
     }
 

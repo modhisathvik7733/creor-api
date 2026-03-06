@@ -3,11 +3,10 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { SignJWT } from "jose"
 import { db } from "../db/client.ts"
-import { users, workspaces, billing, deviceCodes, payments, systemConfig } from "../db/schema.ts"
-import { eq, and, sql } from "drizzle-orm"
+import { users, workspaces, billing, deviceCodes } from "../db/schema.ts"
+import { eq, and } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
 import { requireAuth } from "../middleware/auth.ts"
-import { usdToWorkspaceMicro, microToSmallest } from "../lib/currency.ts"
 import type { SupportedCurrency } from "../lib/currency.ts"
 
 export const authRoutes = new Hono()
@@ -121,8 +120,6 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
       currency,
     })
 
-    // Grant onboarding credits
-    await grantOnboardingCredits(workspaceId, userId, currency)
   }
 
   // Generate JWT
@@ -214,8 +211,6 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
       currency,
     })
 
-    // Grant onboarding credits
-    await grantOnboardingCredits(workspaceId, userId, currency)
   }
 
   const token = await createJWT(userId, workspaceId)
@@ -390,48 +385,3 @@ function detectCurrency(acceptLanguage: string | undefined): SupportedCurrency {
   return "USD"
 }
 
-/** Grant onboarding credits for new signups */
-async function grantOnboardingCredits(workspaceId: string, userId: string, currency: SupportedCurrency) {
-  try {
-    // Get onboarding amount from system config
-    const configRow = await db
-      .select()
-      .from(systemConfig)
-      .where(eq(systemConfig.key, "onboarding_credits_usd"))
-      .then((r) => r[0])
-    const creditsUsd = Number(configRow?.value ?? 0.30)
-    if (creditsUsd <= 0) return
-
-    // Get exchange rates
-    const ratesRow = await db
-      .select()
-      .from(systemConfig)
-      .where(eq(systemConfig.key, "exchange_rates"))
-      .then((r) => r[0])
-    const rates: Record<string, number> = ratesRow?.value
-      ? (typeof ratesRow.value === "string" ? JSON.parse(ratesRow.value) : ratesRow.value as Record<string, number>)
-      : { USD: 1, INR: 85, EUR: 0.92 }
-
-    const creditsMicro = usdToWorkspaceMicro(creditsUsd, rates, currency)
-    if (creditsMicro <= 0) return
-
-    await db
-      .update(billing)
-      .set({ balance: sql`${billing.balance} + ${creditsMicro}` })
-      .where(eq(billing.workspaceId, workspaceId))
-
-    await db.insert(payments).values({
-      id: createId("pay"),
-      workspaceId,
-      userId,
-      type: "onboarding",
-      amountSmallest: microToSmallest(creditsMicro),
-      currency,
-      status: "captured",
-      metadata: { creditsUsd },
-    })
-  } catch (err) {
-    console.error("Failed to grant onboarding credits:", err)
-    // Non-fatal — user can still use the product
-  }
-}

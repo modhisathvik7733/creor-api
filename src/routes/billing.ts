@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature } from "../lib/razorpay.ts"
+import { createRazorpayOrder, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature, updateRazorpaySubscription, cancelRazorpaySubscriptionAtCycleEnd } from "../lib/razorpay.ts"
 import { createId } from "../lib/id.ts"
 import {
   MICRO,
@@ -61,16 +61,24 @@ billingRoutes.get("/", async (c) => {
 
   const currency = result.currency as SupportedCurrency
 
+  // Get active plan
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  const planId = sub?.plan ?? "free"
+  const plan = await db.select().from(plans).where(eq(plans.id, planId)).then((r) => r[0])
+
   return c.json({
     balance: microToDisplay(result.balance),
     currency,
     symbol: SYMBOL[currency] ?? "$",
+    plan: plan ? { id: plan.id, name: plan.name } : { id: "free", name: "Free" },
     monthlyLimit: result.monthlyLimit,
     monthlyUsage: microToDisplay(result.monthlyUsage ?? 0),
-    reloadEnabled: result.reloadEnabled,
-    reloadAmount: result.reloadAmount,
-    reloadTrigger: result.reloadTrigger,
-    hasSubscription: !!result.razorpaySubscriptionId,
+    hasSubscription: !!sub,
   })
 })
 
@@ -106,10 +114,10 @@ billingRoutes.get("/quota", async (c) => {
 
   const hasSubscription = !!sub
 
-  // Plan info
-  const plan = sub
-    ? await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
-    : null
+  // Get effective plan (free tier for non-subscribers)
+  const userPlan = hasSubscription
+    ? await db.select().from(plans).where(eq(plans.id, sub!.plan)).then((r) => r[0])
+    : await db.select().from(plans).where(eq(plans.id, "free")).then((r) => r[0])
 
   // Monthly usage (lazy-reset aware)
   const now = new Date()
@@ -119,29 +127,40 @@ billingRoutes.get("/quota", async (c) => {
       ? 0
       : (bill.monthlyUsage ?? 0)
 
-  // Monthly limit
-  const planLimitLocal = plan?.monthlyLimit
-    ? Math.round(plan.monthlyLimit * rate)
-    : null
+  // Plan limit in workspace currency micro-units
+  const planLimitLocal = userPlan?.monthlyLimit
+    ? Math.round(userPlan.monthlyLimit * rate)
+    : Math.round(500000 * rate) // fallback free tier $0.50
   const workspaceLimitMicro = bill.monthlyLimit
     ? bill.monthlyLimit * MICRO
     : null
   const effectiveLimit = workspaceLimitMicro ?? planLimitLocal
+
+  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
+  const hasCredits = bill.balance > 0
 
   // Determine if user can send
   let canSend = true
   let blockReason: string | null = null
   const warnings: string[] = []
 
-  if (!hasSubscription && bill.balance <= 0) {
+  if (overPlanLimit && !hasCredits) {
     canSend = false
-    blockReason = "credits"
-  } else if (effectiveLimit !== null && monthlyUsage >= effectiveLimit) {
-    canSend = false
-    blockReason = "monthly"
+    blockReason = hasSubscription ? "limit_no_credits" : "free_limit_no_credits"
   }
 
-  // Low balance warning
+  // Overage warning
+  if (overPlanLimit && hasCredits) {
+    warnings.push("using_credits")
+  }
+
+  // Monthly approaching
+  if (effectiveLimit !== null && monthlyUsage > 0 && !overPlanLimit) {
+    const pct = Math.round((monthlyUsage / effectiveLimit) * 100)
+    if (pct >= 80) warnings.push("monthly_approaching")
+  }
+
+  // Low credits warning
   const lowThresholdRow = await db
     .select()
     .from(systemConfig)
@@ -149,28 +168,22 @@ billingRoutes.get("/quota", async (c) => {
     .then((r) => r[0])
   const lowThresholdUsd = Number(lowThresholdRow?.value ?? 0.5)
   const lowThresholdLocal = Math.round(lowThresholdUsd * rate * MICRO)
-  if (!hasSubscription && bill.balance > 0 && bill.balance < lowThresholdLocal) {
-    warnings.push("low_balance")
-  }
-
-  // Monthly approaching
-  if (effectiveLimit !== null && monthlyUsage > 0) {
-    const pct = Math.round((monthlyUsage / effectiveLimit) * 100)
-    if (pct >= 80 && pct < 100) warnings.push("monthly_approaching")
+  if (bill.balance > 0 && bill.balance < lowThresholdLocal) {
+    warnings.push("low_credits")
   }
 
   const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
 
-  const prices = plan?.prices as Record<string, number> | null
+  const prices = userPlan?.prices as Record<string, number> | null
   const planPrice = prices?.[currency] ? (prices[currency] as number) / 100 : null
 
   return c.json({
     balance: microToDisplay(bill.balance),
     currency,
     symbol: SYMBOL[currency] ?? "$",
-    plan: plan
-      ? { id: plan.id, name: plan.name, price: planPrice }
-      : null,
+    plan: userPlan
+      ? { id: userPlan.id, name: userPlan.name, price: planPrice }
+      : { id: "free", name: "Free", price: 0 },
     monthly: {
       current: microToDisplay(monthlyUsage),
       max: effectiveLimit !== null ? microToDisplay(effectiveLimit) : null,
@@ -183,6 +196,7 @@ billingRoutes.get("/quota", async (c) => {
     canSend,
     blockReason,
     warnings,
+    overageActive: overPlanLimit && hasCredits,
     exchangeRates,
   })
 })
@@ -403,7 +417,7 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
     id: createId("sub"),
     workspaceId: auth.workspaceId,
     userId: auth.userId,
-    plan: planId,
+    plan: planId as "starter" | "pro" | "team",
     razorpaySubscriptionId: subscriptionId,
   }).onConflictDoNothing()
 
@@ -555,6 +569,131 @@ billingRoutes.get("/subscription", async (c) => {
     price: prices?.[currency] ? (prices[currency] as number) / 100 : 0,
     currency,
     graceUntil: sub.graceUntil?.toISOString() ?? null,
+    pendingPlan: sub.pendingPlan ?? null,
+    pendingPlanEffectiveAt: sub.pendingPlanEffectiveAt?.toISOString() ?? null,
+  })
+})
+
+// ── Change plan (upgrade/downgrade) ──
+
+const changePlanSchema = z.object({
+  plan: z.enum(["starter", "pro", "team"]),
+})
+
+billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSchema), async (c) => {
+  const { plan: newPlanId } = c.req.valid("json")
+  const auth = c.get("auth")
+
+  // Get current subscription
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  if (!sub?.razorpaySubscriptionId) {
+    return c.json({ error: "No active subscription to change" }, 400)
+  }
+  if (sub.plan === newPlanId) {
+    return c.json({ error: "Already on this plan" }, 400)
+  }
+
+  // Get new plan and its Razorpay plan ID
+  const newPlan = await db.select().from(plans).where(eq(plans.id, newPlanId)).then((r) => r[0])
+  if (!newPlan) return c.json({ error: "Plan not found" }, 404)
+
+  const bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, auth.workspaceId))
+    .then((r) => r[0])
+
+  const currency = (bill?.currency ?? "INR") as SupportedCurrency
+  const rzPlanIds = newPlan.razorpayPlanIds as Record<string, string> | null
+  const rzPlanId = rzPlanIds?.[currency]
+  if (!rzPlanId) return c.json({ error: `Plan not available in ${currency}` }, 400)
+
+  // Determine direction
+  const currentPlan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
+  const currentPrice = (currentPlan?.prices as Record<string, number>)?.[currency] ?? 0
+  const newPrice = (newPlan.prices as Record<string, number>)?.[currency] ?? 0
+  const isUpgrade = newPrice > currentPrice
+
+  // Call Razorpay
+  try {
+    await updateRazorpaySubscription({
+      subscriptionId: sub.razorpaySubscriptionId,
+      planId: rzPlanId,
+      scheduleChangeAt: isUpgrade ? "now" : "cycle_end",
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to change plan"
+    return c.json({ error: message }, 500)
+  }
+
+  if (isUpgrade) {
+    // Immediate: update subscription record now
+    await db
+      .update(subscriptions)
+      .set({
+        plan: newPlanId,
+        pendingPlan: null,
+        pendingPlanEffectiveAt: null,
+      })
+      .where(eq(subscriptions.id, sub.id))
+  } else {
+    // Downgrade: store pending, takes effect at cycle end
+    const rzSub = await fetchRazorpaySubscription(sub.razorpaySubscriptionId)
+    const effectiveAt = rzSub.current_end
+      ? new Date(rzSub.current_end * 1000)
+      : new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + 1, 1))
+
+    await db
+      .update(subscriptions)
+      .set({
+        pendingPlan: newPlanId,
+        pendingPlanEffectiveAt: effectiveAt,
+      })
+      .where(eq(subscriptions.id, sub.id))
+  }
+
+  return c.json({
+    success: true,
+    direction: isUpgrade ? "upgrade" : "downgrade",
+    newPlan: newPlanId,
+    immediate: isUpgrade,
+  })
+})
+
+// ── Cancel subscription (at end of billing cycle) ──
+
+billingRoutes.post("/cancel-subscription", requireAdmin, async (c) => {
+  const auth = c.get("auth")
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  if (!sub?.razorpaySubscriptionId) {
+    return c.json({ error: "No active subscription" }, 400)
+  }
+
+  try {
+    await cancelRazorpaySubscriptionAtCycleEnd(sub.razorpaySubscriptionId)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to cancel subscription"
+    return c.json({ error: message }, 500)
+  }
+
+  // Fetch cycle end date from Razorpay
+  const rzSub = await fetchRazorpaySubscription(sub.razorpaySubscriptionId)
+  const endsAt = rzSub.current_end ? new Date(rzSub.current_end * 1000) : null
+
+  return c.json({
+    success: true,
+    message: "Subscription will be cancelled at end of billing cycle.",
+    endsAt: endsAt?.toISOString() ?? null,
   })
 })
 

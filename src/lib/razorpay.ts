@@ -108,11 +108,40 @@ export async function fetchRazorpaySubscription(subscriptionId: string) {
   }>(`/subscriptions/${subscriptionId}`)
 }
 
-/** Cancel a subscription */
+/** Cancel a subscription immediately */
 export async function cancelRazorpaySubscription(subscriptionId: string) {
   return rzFetch<{ id: string; status: string }>(
     `/subscriptions/${subscriptionId}/cancel`,
     { method: "POST" },
+  )
+}
+
+/** Cancel a subscription at end of current billing cycle */
+export async function cancelRazorpaySubscriptionAtCycleEnd(subscriptionId: string) {
+  return rzFetch<{ id: string; status: string }>(
+    `/subscriptions/${subscriptionId}/cancel`,
+    {
+      method: "POST",
+      body: JSON.stringify({ cancel_at_cycle_end: true }),
+    },
+  )
+}
+
+/** Update subscription plan (upgrade/downgrade) */
+export async function updateRazorpaySubscription(params: {
+  subscriptionId: string
+  planId: string
+  scheduleChangeAt: "now" | "cycle_end"
+}) {
+  return rzFetch<{ id: string; plan_id: string; status: string }>(
+    `/subscriptions/${params.subscriptionId}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        plan_id: params.planId,
+        schedule_change_at: params.scheduleChangeAt,
+      }),
+    },
   )
 }
 

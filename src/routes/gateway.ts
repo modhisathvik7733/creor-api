@@ -63,22 +63,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
   const hasSubscription = !!sub
 
-  // Balance check (credit users only)
-  if (!hasSubscription && bill.balance <= 0) {
-    return c.json(
-      {
-        error: {
-          type: "CreditsError",
-          message: "Insufficient credits. Add credits at https://creor.ai/dashboard/billing",
-          balance: 0,
-          currency: bill.currency,
-        },
-      },
-      402,
-    )
-  }
-
-  // Monthly limit check using pre-aggregated counter
+  // Monthly usage (lazy-reset aware)
   const now = new Date()
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
   const monthlyUsage =
@@ -86,24 +71,20 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       ? 0
       : (bill.monthlyUsage ?? 0)
 
-  // Load plan to get monthly limit
-  const plan = sub
-    ? await db
-        .select()
-        .from(plans)
-        .where(eq(plans.id, sub.plan))
-        .then((r) => r[0])
-    : null
-
   // Fetch exchange rates for currency conversion
   const exchangeRates = await getExchangeRates()
   const currency = bill.currency as SupportedCurrency
   const rate = exchangeRates[currency] ?? 1
 
+  // Determine effective plan limit
+  const userPlan = hasSubscription
+    ? await db.select().from(plans).where(eq(plans.id, sub!.plan)).then((r) => r[0])
+    : await db.select().from(plans).where(eq(plans.id, "free")).then((r) => r[0])
+
   // Plan limit is in USD micro-units → convert to workspace currency
-  const planLimitLocal = plan?.monthlyLimit
-    ? Math.round(plan.monthlyLimit * rate)
-    : null
+  const planLimitLocal = userPlan?.monthlyLimit
+    ? Math.round(userPlan.monthlyLimit * rate)
+    : Math.round(500000 * rate) // fallback free tier $0.50
 
   // Workspace override (legacy: monthlyLimit is in INR units → convert to micro-units)
   const workspaceLimitMicro = bill.monthlyLimit
@@ -112,18 +93,22 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
   const effectiveLimit = workspaceLimitMicro ?? planLimitLocal
 
-  if (effectiveLimit !== null && monthlyUsage >= effectiveLimit) {
+  // Block if over plan limit AND no credits for overage
+  if (effectiveLimit !== null && monthlyUsage >= effectiveLimit && bill.balance <= 0) {
     const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
     return c.json(
       {
         error: {
           type: "LimitError",
-          limit: "monthly",
-          current: microToDisplay(monthlyUsage),
-          max: microToDisplay(effectiveLimit),
+          plan: userPlan?.id ?? "free",
+          message: hasSubscription
+            ? "Plan usage limit reached. Add credits or upgrade your plan."
+            : "Free tier limit reached. Subscribe or add credits to continue.",
+          monthlyUsage: microToDisplay(monthlyUsage),
+          monthlyLimit: microToDisplay(effectiveLimit),
+          balance: microToDisplay(bill.balance),
           currency: bill.currency,
           resetsAt: resetDate.toISOString(),
-          message: `Monthly usage limit reached (${microToDisplay(monthlyUsage).toFixed(2)} / ${microToDisplay(effectiveLimit).toFixed(2)} ${bill.currency}). Resets ${resetDate.toISOString()}.`,
         },
       },
       402,
@@ -206,7 +191,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       outputCost,
       exchangeRates,
       currency,
-      hasSubscription,
+      planLimitLocal: effectiveLimit,
     }
 
     // Return response (stream-through for SSE)
@@ -308,7 +293,7 @@ interface CostContext {
   outputCost: number // USD per 1K tokens
   exchangeRates: Record<string, number>
   currency: SupportedCurrency
-  hasSubscription: boolean
+  planLimitLocal: number | null // plan limit in workspace currency micro-units
 }
 
 /** Get exchange rates from system_config (cached in materialized view) */
@@ -349,9 +334,9 @@ async function trackUsageAsync(
   const costMicro = usdToWorkspaceMicro(costUSD, ctx.exchangeRates, ctx.currency)
 
   try {
-    // Atomic: increment monthly counter + deduct balance
+    // Atomic: increment monthly counter + deduct overage from balance
     await db.execute(
-      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.hasSubscription})`,
+      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.planLimitLocal})`,
     )
 
     // Insert usage row

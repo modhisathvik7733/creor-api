@@ -148,6 +148,8 @@ export const subscriptions = pgTable(
     timeRollingUpdated: timestamp("time_rolling_updated"),
     timeFixedUpdated: timestamp("time_fixed_updated"),
     graceUntil: timestamp("grace_until"),
+    pendingPlan: text("pending_plan"),
+    pendingPlanEffectiveAt: timestamp("pending_plan_effective_at"),
     timeCreated: timestamp("time_created").defaultNow().notNull(),
     timeDeleted: timestamp("time_deleted"),
   },
