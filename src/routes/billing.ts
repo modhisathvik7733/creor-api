@@ -198,6 +198,8 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
       usdAmount: String(amount),
     },
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?payment=success`,
+    productName: "Creor Credits",
+    productDescription: "Top-up credits for AI model usage beyond your plan allowance. Credits never expire.",
   })
 
   return c.json({
@@ -231,6 +233,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     return c.json({ error: `Plan ${planId} not configured for Lemon Squeezy` }, 400)
   }
 
+  const planLabel = plan.name ?? planId.charAt(0).toUpperCase() + planId.slice(1)
   const checkout = await createCheckout({
     storeId,
     variantId: plan.lsVariantId,
@@ -241,6 +244,8 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
       plan: planId,
     },
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?subscription=success`,
+    productName: `Creor ${planLabel}`,
+    productDescription: `${planLabel} plan — access all AI models with priority support and higher usage limits.`,
   })
 
   const prices = plan.prices as Record<string, number> | null

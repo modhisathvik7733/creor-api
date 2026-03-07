@@ -100,6 +100,8 @@ export async function createCheckout(params: {
   email?: string
   custom?: Record<string, string> // metadata → flows to webhook meta.custom_data
   redirectUrl?: string
+  productName?: string
+  productDescription?: string
 }): Promise<{ url: string; id: string }> {
   const res = await lsFetch<LSCheckoutResponse>("/checkouts", {
     method: "POST",
@@ -111,8 +113,8 @@ export async function createCheckout(params: {
           checkout_options: {
             embed: false,
             dark: true,
-            media: false,
-            desc: false,
+            media: true,
+            desc: true,
             button_color: "#e5530a",
           },
           checkout_data: {
@@ -120,6 +122,8 @@ export async function createCheckout(params: {
             custom: params.custom ?? {},
           },
           product_options: {
+            name: params.productName ?? undefined,
+            description: params.productDescription ?? undefined,
             redirect_url: params.redirectUrl ?? undefined,
           },
         },
