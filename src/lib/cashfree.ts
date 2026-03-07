@@ -124,8 +124,7 @@ export async function createCashfreePlan(params: {
  * 2. authorization_amount = full plan price (kept, not refunded) — this IS the first month's payment
  * 3. subscription_first_charge_time = 1 month later — recurring charges start after the prepaid month
  *
- * Note: eNACH (bank debit) requires authorization_amount=0, so we exclude it
- * and only offer UPI + card which support charging the full amount upfront.
+ * Cashfree shows all available payment methods (UPI, cards, etc.) automatically.
  */
 export async function createCashfreeSubscription(params: {
   subscriptionId: string
@@ -138,12 +137,11 @@ export async function createCashfreeSubscription(params: {
   tags?: Record<string, string>
 }) {
   // Charge the full plan price as the authorization amount (covers first month).
-  // eNACH mandates require auth_amount=0, so we only allow UPI + card for INR.
-  const isINR = params.currency === "INR"
+  // Don't restrict payment_methods — let Cashfree show all available options
+  // (UPI, cards, net banking, etc.) based on account configuration.
   const authDetails = {
     authorization_amount: params.planAmount,
     authorization_amount_refund: false,
-    payment_methods: isINR ? ["upi", "card"] : ["card"],
   }
 
   // First recurring charge = 1 month from now (upfront auth covers the first month).
