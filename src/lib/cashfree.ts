@@ -116,21 +116,46 @@ export async function createCashfreePlan(params: {
   })
 }
 
-/** Create a recurring subscription */
+/**
+ * Create a recurring subscription — charges full plan price upfront.
+ *
+ * Flow:
+ * 1. Checkout collects payment via UPI/card and sets up auto-pay mandate
+ * 2. authorization_amount = full plan price (kept, not refunded) — this IS the first month's payment
+ * 3. subscription_first_charge_time = 1 month later — recurring charges start after the prepaid month
+ *
+ * Note: eNACH (bank debit) requires authorization_amount=0, so we exclude it
+ * and only offer UPI + card which support charging the full amount upfront.
+ */
 export async function createCashfreeSubscription(params: {
   subscriptionId: string
   planId: string
   customerEmail: string
   customerPhone: string
+  planAmount: number // full plan price in display units (e.g. 23.99)
   returnUrl?: string
   currency?: string
   tags?: Record<string, string>
 }) {
-  // INR subscriptions use EMANDATE to enable UPI AutoPay + Cards
-  // USD/EUR only support card-based authorization
-  const authDetails = params.currency === "INR"
-    ? { authorization_type: "EMANDATE", authorization_amount: 1, authorization_amount_refund: false }
-    : { authorization_amount: 1, authorization_amount_refund: false }
+  // Charge the full plan price as the authorization amount (covers first month).
+  // eNACH mandates require auth_amount=0, so we only allow UPI + card for INR.
+  const isINR = params.currency === "INR"
+  const authDetails = {
+    authorization_amount: params.planAmount,
+    authorization_amount_refund: false,
+    payment_methods: isINR ? ["upi", "card"] : ["card"],
+  }
+
+  // First recurring charge = 1 month from now (upfront auth covers the first month).
+  // Cap day-of-month to avoid overflow (e.g. Jan 31 → Feb 28, not Mar 3).
+  const now = new Date()
+  const nextMonth = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth() + 1,
+    Math.min(now.getUTCDate(), daysInMonth(now.getUTCFullYear(), now.getUTCMonth() + 1)),
+    now.getUTCHours(), now.getUTCMinutes(), now.getUTCSeconds(),
+  ))
+  const firstChargeTime = nextMonth.toISOString()
 
   return cfFetch<{
     cf_subscription_id: string
@@ -149,12 +174,18 @@ export async function createCashfreeSubscription(params: {
         plan_id: params.planId,
       },
       authorization_details: authDetails,
+      subscription_first_charge_time: firstChargeTime,
       subscription_meta: {
         return_url: params.returnUrl ?? null,
       },
       subscription_tags: params.tags ?? {},
     }),
   })
+}
+
+/** Days in a given month (0-indexed month, e.g. 0=Jan, 11=Dec) */
+function daysInMonth(year: number, month: number): number {
+  return new Date(year, month + 1, 0).getDate()
 }
 
 /** Fetch a subscription's current status */

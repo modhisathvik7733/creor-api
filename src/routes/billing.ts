@@ -365,12 +365,16 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
   }
 
   try {
+    const prices = plan.prices as Record<string, number> | null
+    const price = prices?.[currency] ? (prices[currency] as number) / 100 : 0
+
     const subscriptionId = `sub_${auth.workspaceId}_${Date.now()}`
     const subscription = await createCashfreeSubscription({
       subscriptionId,
       planId: cashfreePlanId,
       customerEmail: auth.email,
       customerPhone: "9999999999", // placeholder — Cashfree requires phone
+      planAmount: price, // charge full plan price upfront
       returnUrl: "https://creor.ai/dashboard/billing?payment=success",
       currency,
       tags: {
@@ -379,9 +383,6 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
         plan: planId,
       },
     })
-
-    const prices = plan.prices as Record<string, number> | null
-    const price = prices?.[currency] ? (prices[currency] as number) / 100 : 0
 
     return c.json({
       subscriptionId: subscription.subscription_id,
@@ -479,7 +480,7 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
         type: "subscription",
         amountSmallest,
         currency,
-        cashfreePaymentId: `sub_payment_${subscriptionId}`,
+        cashfreePaymentId: `sub_upfront_${subscriptionId}`,
         status: "captured",
         metadata: { subscriptionId, plan: planId },
       })
@@ -604,6 +605,13 @@ billingRoutes.get("/subscription", async (c) => {
 })
 
 // ── Change plan (upgrade/downgrade) ──
+//
+// Upgrades: Cancel old subscription on Cashfree, create a NEW subscription
+//           for the higher plan. Returns a checkout session so the user
+//           completes payment + new mandate setup.
+//
+// Downgrades: Store as pending. Applied at next billing cycle
+//             (handled by SUBSCRIPTION_PAYMENT_SUCCESS webhook).
 
 const changePlanSchema = z.object({
   plan: z.enum(["starter", "pro", "team"]),
@@ -627,7 +635,7 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
     return c.json({ error: "Already on this plan" }, 400)
   }
 
-  // Get new plan and its Cashfree plan ID
+  // Get new plan
   const newPlan = await db.select().from(plans).where(eq(plans.id, newPlanId)).then((r) => r[0])
   if (!newPlan) return c.json({ error: "Plan not found" }, 404)
 
@@ -638,6 +646,14 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
     .then((r) => r[0])
 
   const currency = (bill?.currency ?? "INR") as SupportedCurrency
+
+  // Determine direction
+  const currentPlan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
+  const currentPrice = (currentPlan?.prices as Record<string, number>)?.[currency] ?? 0
+  const newPrice = (newPlan.prices as Record<string, number>)?.[currency] ?? 0
+  const isUpgrade = newPrice > currentPrice
+
+  // ── Ensure Cashfree plan exists for the new plan ──
   const cfPlanIds = newPlan.cashfreePlanIds as Record<string, string> | null
   let cfPlanId = cfPlanIds?.[currency]
 
@@ -668,36 +684,71 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
     }
   }
 
-  // Determine direction
-  const currentPlan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
-  const currentPrice = (currentPlan?.prices as Record<string, number>)?.[currency] ?? 0
-  const newPrice = (newPlan.prices as Record<string, number>)?.[currency] ?? 0
-  const isUpgrade = newPrice > currentPrice
-
-  // Call Cashfree
-  try {
-    await manageCashfreeSubscription({
-      subscriptionId: sub.cashfreeSubscriptionId,
-      action: "CHANGE_PLAN",
-      actionDetails: { planId: cfPlanId },
-    })
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Failed to change plan"
-    return c.json({ error: message }, 500)
-  }
-
   if (isUpgrade) {
-    // Immediate: update subscription record now
+    // ── UPGRADE: cancel old subscription, create new one ──
+    // Cashfree mandates are capped at the original plan price,
+    // so CHANGE_PLAN fails for higher amounts. Instead we cancel + re-subscribe.
+
+    // 1. Cancel old subscription on Cashfree
+    try {
+      await manageCashfreeSubscription({
+        subscriptionId: sub.cashfreeSubscriptionId,
+        action: "CANCEL",
+      })
+    } catch {
+      // Best effort — may already be cancelled or expired
+    }
+
+    // 2. Soft-delete old subscription in our DB
     await db
       .update(subscriptions)
-      .set({
-        plan: newPlanId,
-        pendingPlan: null,
-        pendingPlanEffectiveAt: null,
-      })
+      .set({ timeDeleted: new Date() })
       .where(eq(subscriptions.id, sub.id))
+
+    await db
+      .update(billing)
+      .set({ cashfreeSubscriptionId: null, timeUpdated: new Date() })
+      .where(eq(billing.workspaceId, auth.workspaceId))
+
+    // 3. Create new subscription for the higher plan (same flow as /subscribe)
+    const prices = newPlan.prices as Record<string, number> | null
+    const price = prices?.[currency] ? (prices[currency] as number) / 100 : 0
+
+    try {
+      const subscriptionId = `sub_${auth.workspaceId}_${Date.now()}`
+      const subscription = await createCashfreeSubscription({
+        subscriptionId,
+        planId: cfPlanId,
+        customerEmail: auth.email,
+        customerPhone: "9999999999",
+        planAmount: price,
+        returnUrl: "https://creor.ai/dashboard/billing?payment=success",
+        currency,
+        tags: {
+          workspaceId: auth.workspaceId,
+          userId: auth.userId,
+          plan: newPlanId,
+        },
+      })
+
+      return c.json({
+        success: true,
+        direction: "upgrade" as const,
+        newPlan: newPlanId,
+        immediate: false,
+        // Frontend must redirect to Cashfree checkout for the new subscription
+        requiresCheckout: true,
+        subscriptionId: subscription.subscription_id,
+        paymentSessionId: subscription.subscription_session_id,
+        price,
+        currency,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Subscription creation failed"
+      return c.json({ error: message }, 500)
+    }
   } else {
-    // Downgrade: store pending, takes effect at cycle end
+    // ── DOWNGRADE: store pending, takes effect at cycle end ──
     const cfSub = await fetchCashfreeSubscription(sub.cashfreeSubscriptionId)
     const effectiveAt = cfSub.next_schedule_date
       ? new Date(cfSub.next_schedule_date)
@@ -710,14 +761,15 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
         pendingPlanEffectiveAt: effectiveAt,
       })
       .where(eq(subscriptions.id, sub.id))
-  }
 
-  return c.json({
-    success: true,
-    direction: isUpgrade ? "upgrade" : "downgrade",
-    newPlan: newPlanId,
-    immediate: isUpgrade,
-  })
+    return c.json({
+      success: true,
+      direction: "downgrade" as const,
+      newPlan: newPlanId,
+      immediate: false,
+      requiresCheckout: false,
+    })
+  }
 })
 
 // ── Cancel subscription ──
@@ -768,6 +820,44 @@ billingRoutes.post("/cancel-subscription", requireAdmin, async (c) => {
     message: "Subscription cancelled. Access continues until end of current billing cycle.",
     endsAt: endsAt?.toISOString() ?? null,
   })
+})
+
+// ── Dev: reset subscription (for testing) ──
+
+billingRoutes.post("/reset-subscription", requireAdmin, async (c) => {
+  const auth = c.get("auth")
+
+  // Cancel on Cashfree (best effort)
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  if (sub?.cashfreeSubscriptionId) {
+    try {
+      await manageCashfreeSubscription({
+        subscriptionId: sub.cashfreeSubscriptionId,
+        action: "CANCEL",
+      })
+    } catch {
+      // ignore — may already be cancelled
+    }
+  }
+
+  // Soft-delete all subscriptions for this workspace
+  await db
+    .update(subscriptions)
+    .set({ timeDeleted: new Date() })
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+
+  // Clear subscription from billing record
+  await db
+    .update(billing)
+    .set({ cashfreeSubscriptionId: null, timeUpdated: new Date() })
+    .where(eq(billing.workspaceId, auth.workspaceId))
+
+  return c.json({ success: true, message: "Subscription reset. You can now subscribe again." })
 })
 
 // ── Payment history ──

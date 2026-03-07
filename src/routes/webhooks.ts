@@ -1,7 +1,7 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
 import { billing, subscriptions, webhookEvents, payments, plans } from "../db/schema.ts"
-import { eq, sql } from "drizzle-orm"
+import { eq, and, sql } from "drizzle-orm"
 import { verifyCashfreeWebhookSignature } from "../lib/cashfree.ts"
 import { createId } from "../lib/id.ts"
 
@@ -90,7 +90,7 @@ webhookRoutes.post("/cashfree", async (c) => {
     }
 
     case "SUBSCRIPTION_NEW_ACTIVATION": {
-      // Subscription activated
+      // Subscription activated — full plan price was charged upfront
       const sub = event.data?.subscription
       if (!sub) break
 
@@ -116,6 +116,30 @@ webhookRoutes.post("/cashfree", async (c) => {
           timeUpdated: new Date(),
         })
         .where(eq(billing.workspaceId, workspaceId))
+
+      // Record the upfront subscription payment in history
+      const planRow = await db.select().from(plans).where(eq(plans.id, plan)).then((r) => r[0])
+      const bill = await db.select().from(billing).where(eq(billing.workspaceId, workspaceId)).then((r) => r[0])
+      if (planRow && bill) {
+        const currency = bill.currency ?? "INR"
+        const prices = planRow.prices as Record<string, number> | null
+        const amountSmallest = prices?.[currency] ?? 0
+        try {
+          await db.insert(payments).values({
+            id: createId("pay"),
+            workspaceId,
+            userId,
+            type: "subscription",
+            amountSmallest,
+            currency,
+            cashfreePaymentId: `sub_upfront_${sub.subscription_id}`,
+            status: "captured",
+            metadata: { subscriptionId: sub.subscription_id, plan },
+          })
+        } catch {
+          // Unique constraint — already recorded (e.g. by activate-subscription endpoint)
+        }
+      }
 
       break
     }
@@ -189,13 +213,18 @@ webhookRoutes.post("/cashfree", async (c) => {
           .set({ timeDeleted: new Date() })
           .where(eq(subscriptions.cashfreeSubscriptionId, sub.subscription_id))
 
+        // Only clear billing's subscription ID if it still points to THIS subscription.
+        // During upgrades, the old sub is cancelled but a new one may already be active.
         await db
           .update(billing)
           .set({
             cashfreeSubscriptionId: null,
             timeUpdated: new Date(),
           })
-          .where(eq(billing.workspaceId, workspaceId))
+          .where(and(
+            eq(billing.workspaceId, workspaceId),
+            eq(billing.cashfreeSubscriptionId, sub.subscription_id),
+          ))
       }
 
       break
