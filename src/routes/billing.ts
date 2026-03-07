@@ -512,7 +512,7 @@ billingRoutes.patch("/limit", requireAdmin, zValidator("json", limitSchema), asy
 // ── Switch workspace currency ──
 
 const currencySchema = z.object({
-  currency: z.enum(["USD", "INR", "EUR"]),
+  currency: z.enum(["USD", "INR"]),
 })
 
 billingRoutes.patch("/currency", requireAdmin, zValidator("json", currencySchema), async (c) => {

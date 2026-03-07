@@ -1,5 +1,5 @@
 /** Supported billing currencies */
-export type SupportedCurrency = "USD" | "INR" | "EUR"
+export type SupportedCurrency = "USD" | "INR"
 
 /** 1 unit of currency = 1,000,000 micro-units */
 export const MICRO = 1_000_000
@@ -8,7 +8,6 @@ export const MICRO = 1_000_000
 export const SYMBOL: Record<SupportedCurrency, string> = {
   USD: "$",
   INR: "₹",
-  EUR: "€",
 }
 
 /** Convert micro-units to display value (e.g. 1500000 → 1.50) */
@@ -44,5 +43,5 @@ export function usdToWorkspaceMicro(
 
 /** Check if a currency string is a supported currency */
 export function isSupportedCurrency(c: string): c is SupportedCurrency {
-  return c === "USD" || c === "INR" || c === "EUR"
+  return c === "USD" || c === "INR"
 }
