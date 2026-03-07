@@ -350,7 +350,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
       planAmount: price,
       customerEmail: auth.email,
       customerPhone: "9999999999", // placeholder — Cashfree requires phone
-      returnUrl: "https://creor.ai/dashboard/billing?payment=success",
+      returnUrl: "https://creor.ai/dashboard/billing",
       currency,
       tags: {
         workspaceId: auth.workspaceId,
@@ -672,7 +672,7 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
         planAmount: price,
         customerEmail: auth.email,
         customerPhone: "9999999999",
-        returnUrl: "https://creor.ai/dashboard/billing?payment=success",
+        returnUrl: "https://creor.ai/dashboard/billing",
         currency,
         tags: {
           workspaceId: auth.workspaceId,
