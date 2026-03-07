@@ -111,8 +111,10 @@ export async function createCheckout(params: {
           ...(params.customPrice !== undefined && { custom_price: params.customPrice }),
           checkout_options: {
             embed: params.embed ?? true,
+            dark: true,
             media: false,
             desc: false,
+            button_color: "#e5530a",
           },
           checkout_data: {
             email: params.email ?? undefined,
