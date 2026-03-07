@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { db } from "../db/client.ts"
 import { billing, subscriptions, webhookEvents, payments, plans } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
-import { verifyWebhookSignature, type LSWebhookEvent } from "../lib/lemonsqueezy.ts"
+import { verifyWebhookSignature, updateSubscription, type LSWebhookEvent } from "../lib/lemonsqueezy.ts"
 import { createId } from "../lib/id.ts"
 
 export const webhookRoutes = new Hono()
@@ -244,6 +244,39 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
           })
         } catch {
           // Already recorded
+        }
+
+        // Execute pending downgrade if scheduled
+        if (sub.pendingPlan && sub.lsSubscriptionId) {
+          const newPlan = await db
+            .select()
+            .from(plans)
+            .where(eq(plans.id, sub.pendingPlan))
+            .then((r) => r[0])
+
+          if (newPlan?.lsVariantId) {
+            try {
+              // Change the variant on LS — no proration since this is at renewal
+              await updateSubscription(sub.lsSubscriptionId, {
+                variantId: newPlan.lsVariantId,
+                disableProrations: true,
+              })
+
+              // Update local DB
+              await db
+                .update(subscriptions)
+                .set({
+                  plan: sub.pendingPlan as "starter" | "pro" | "team",
+                  pendingPlan: null,
+                  pendingPlanEffectiveAt: null,
+                })
+                .where(eq(subscriptions.id, sub.id))
+
+              console.log(`[webhook] Executed pending downgrade: ${sub.plan} → ${sub.pendingPlan} for workspace ${sub.workspaceId}`)
+            } catch (err) {
+              console.error(`[webhook] Failed to execute pending downgrade for workspace ${sub.workspaceId}:`, err)
+            }
+          }
         }
       }
 

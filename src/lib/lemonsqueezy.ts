@@ -152,6 +152,8 @@ export async function updateSubscription(
     variantId?: string
     cancelled?: boolean // false = resume a cancelled subscription
     pause?: { mode: "free"; resumes_at?: string } | null // null = unpause
+    invoiceImmediately?: boolean // charge prorated diff now (upgrades)
+    disableProrations?: boolean  // skip proration calc (scheduled downgrades)
   },
 ): Promise<LSSubscription> {
   const attributes: Record<string, unknown> = {}
@@ -164,6 +166,12 @@ export async function updateSubscription(
   }
   if (params.pause !== undefined) {
     attributes.pause = params.pause
+  }
+  if (params.invoiceImmediately !== undefined) {
+    attributes.invoice_immediately = params.invoiceImmediately
+  }
+  if (params.disableProrations !== undefined) {
+    attributes.disable_prorations = params.disableProrations
   }
 
   return lsFetch<LSSubscription>(`/subscriptions/${subscriptionId}`, {

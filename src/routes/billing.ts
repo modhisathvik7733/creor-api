@@ -312,7 +312,7 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
   if (!sub?.lsSubscriptionId) {
     return c.json({ error: "No active subscription to change" }, 400)
   }
-  if (sub.plan === newPlanId) {
+  if (sub.plan === newPlanId && !sub.pendingPlan) {
     return c.json({ error: "Already on this plan" }, 400)
   }
 
@@ -320,28 +320,78 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
   const newPlan = await db.select().from(plans).where(eq(plans.id, newPlanId)).then((r) => r[0])
   if (!newPlan?.lsVariantId) return c.json({ error: "Plan not configured" }, 404)
 
-  // Update subscription on Lemon Squeezy (instant — LS handles prorations)
-  await updateSubscription(sub.lsSubscriptionId, {
-    variantId: newPlan.lsVariantId,
-  })
-
-  // Determine direction for frontend display
+  // Determine direction
   const currentPlan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
   const currentPrice = (currentPlan?.prices as Record<string, number>)?.["USD"] ?? 0
   const newPrice = (newPlan.prices as Record<string, number>)?.["USD"] ?? 0
   const isUpgrade = newPrice > currentPrice
 
-  // Update local DB immediately (webhook will also confirm)
+  if (isUpgrade) {
+    // ── UPGRADE: Immediate change with prorated charge ──
+    await updateSubscription(sub.lsSubscriptionId, {
+      variantId: newPlan.lsVariantId,
+      invoiceImmediately: true,
+    })
+
+    // Update local DB immediately, clear any pending downgrade
+    await db
+      .update(subscriptions)
+      .set({
+        plan: newPlanId as "starter" | "pro" | "team",
+        pendingPlan: null,
+        pendingPlanEffectiveAt: null,
+      })
+      .where(eq(subscriptions.id, sub.id))
+
+    return c.json({
+      success: true,
+      direction: "upgrade" as const,
+      newPlan: newPlanId,
+    })
+  } else {
+    // ── DOWNGRADE: Schedule for end of billing cycle ──
+    // Fetch subscription from LS to get renews_at date
+    const lsSub = await getLsSubscription(sub.lsSubscriptionId)
+    const renewsAt = lsSub.data.attributes.renews_at
+
+    // Record the pending downgrade — do NOT change anything on LS yet
+    await db
+      .update(subscriptions)
+      .set({
+        pendingPlan: newPlanId,
+        pendingPlanEffectiveAt: renewsAt ? new Date(renewsAt) : null,
+      })
+      .where(eq(subscriptions.id, sub.id))
+
+    return c.json({
+      success: true,
+      direction: "downgrade" as const,
+      newPlan: newPlanId,
+      effectiveAt: renewsAt ?? null,
+    })
+  }
+})
+
+// ── Cancel pending downgrade ──
+
+billingRoutes.post("/cancel-pending-change", requireAdmin, async (c) => {
+  const auth = c.get("auth")
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  if (!sub?.pendingPlan) {
+    return c.json({ error: "No pending plan change" }, 400)
+  }
+
   await db
     .update(subscriptions)
-    .set({ plan: newPlanId as "starter" | "pro" | "team" })
+    .set({ pendingPlan: null, pendingPlanEffectiveAt: null })
     .where(eq(subscriptions.id, sub.id))
 
-  return c.json({
-    success: true,
-    direction: isUpgrade ? "upgrade" : "downgrade",
-    newPlan: newPlanId,
-  })
+  return c.json({ success: true })
 })
 
 // ── Cancel subscription ──
