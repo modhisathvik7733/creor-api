@@ -210,11 +210,18 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
     }
 
     case "subscription_payment_success": {
-      // Recurring charge succeeded — record payment
+      // Recurring/prorated charge succeeded — record payment
       const attrs = event.data.attributes as Record<string, unknown>
       const lsSubscriptionId = attrs.subscription_id ? String(attrs.subscription_id) : null
+      const billingReason = attrs.billing_reason as string | undefined // "initial", "renewal", "updated"
 
       if (!lsSubscriptionId) break
+
+      // Skip prorated upgrade invoices — we already record these in /change-plan
+      if (billingReason === "updated") {
+        console.log(`[webhook] Skipping subscription_payment_success for upgrade proration (billing_reason=updated)`)
+        break
+      }
 
       const sub = await db
         .select()
@@ -226,9 +233,19 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
         .then((r) => r[0])
 
       if (sub) {
-        const plan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
-        const prices = plan?.prices as Record<string, number> | null
-        const amountSmallest = prices?.["USD"] ?? 0
+        // Use actual amount from LS webhook data when available, fall back to plan price
+        let amountSmallest: number
+        if (attrs.subtotal_usd !== undefined && attrs.subtotal_usd !== null) {
+          amountSmallest = Number(attrs.subtotal_usd) // LS sends cents
+        } else if (attrs.total_usd !== undefined && attrs.total_usd !== null) {
+          amountSmallest = Number(attrs.total_usd)
+        } else if (attrs.subtotal !== undefined && attrs.subtotal !== null) {
+          amountSmallest = Number(attrs.subtotal)
+        } else {
+          const plan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
+          const prices = plan?.prices as Record<string, number> | null
+          amountSmallest = prices?.["USD"] ?? 0
+        }
 
         try {
           await db.insert(payments).values({
@@ -240,7 +257,7 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
             currency: "USD",
             lsSubscriptionPaymentId: String(entityId),
             status: "captured",
-            metadata: { subscriptionId: lsSubscriptionId, plan: sub.plan },
+            metadata: { subscriptionId: lsSubscriptionId, plan: sub.plan, billingReason },
           })
         } catch {
           // Already recorded

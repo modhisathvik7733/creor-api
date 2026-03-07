@@ -343,6 +343,30 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
       })
       .where(eq(subscriptions.id, sub.id))
 
+    // Record upgrade payment for immediate visibility in payment history
+    // Amount is the price difference (LS charges the actual prorated amount on-card)
+    const priceDiffCents = newPrice - currentPrice
+    try {
+      await db.insert(payments).values({
+        id: createId("pay"),
+        workspaceId: sub.workspaceId,
+        userId: auth.userId,
+        type: "subscription",
+        amountSmallest: priceDiffCents > 0 ? priceDiffCents : newPrice,
+        currency: "USD",
+        lsOrderId: `upgrade_${sub.lsSubscriptionId}_${newPlanId}`,
+        status: "captured",
+        metadata: {
+          upgrade: true,
+          from: sub.plan,
+          to: newPlanId,
+          subscriptionId: sub.lsSubscriptionId,
+        },
+      })
+    } catch {
+      // Already recorded (idempotent)
+    }
+
     return c.json({
       success: true,
       direction: "upgrade" as const,
@@ -486,14 +510,18 @@ billingRoutes.get("/payments", async (c) => {
     .offset(offset)
 
   return c.json({
-    payments: rows.map((p) => ({
-      id: p.id,
-      type: p.type,
-      amount: p.amountSmallest / 100, // cents → display
-      currency: p.currency,
-      status: p.status,
-      timeCreated: p.timeCreated.toISOString(),
-    })),
+    payments: rows.map((p) => {
+      const meta = p.metadata as Record<string, unknown> | null
+      return {
+        id: p.id,
+        type: p.type,
+        amount: p.amountSmallest / 100, // cents → display
+        currency: p.currency,
+        status: p.status,
+        timeCreated: p.timeCreated.toISOString(),
+        upgrade: meta?.upgrade === true ? { from: meta.from as string, to: meta.to as string } : undefined,
+      }
+    }),
     page,
     limit,
   })
