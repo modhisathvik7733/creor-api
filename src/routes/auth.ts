@@ -7,7 +7,6 @@ import { users, workspaces, billing, deviceCodes } from "../db/schema.ts"
 import { eq, and } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
 import { requireAuth } from "../middleware/auth.ts"
-import type { SupportedCurrency } from "../lib/currency.ts"
 
 export const authRoutes = new Hono()
 
@@ -95,8 +94,6 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
     // Create workspace + user + billing
     workspaceId = createId("ws")
     userId = createId("usr")
-    const currency = detectCurrency(c.req.header("Accept-Language"))
-
     await db.insert(workspaces).values({
       id: workspaceId,
       name: githubUser.name ?? githubUser.login,
@@ -117,7 +114,6 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
     await db.insert(billing).values({
       id: createId("bill"),
       workspaceId,
-      currency,
     })
 
   }
@@ -184,8 +180,6 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
   } else {
     workspaceId = createId("ws")
     userId = createId("usr")
-    const currency = detectCurrency(c.req.header("Accept-Language"))
-
     const slug = await uniqueSlug(googleUser.email.split("@")[0].toLowerCase())
 
     await db.insert(workspaces).values({
@@ -208,7 +202,6 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
     await db.insert(billing).values({
       id: createId("bill"),
       workspaceId,
-      currency,
     })
 
   }
@@ -372,16 +365,4 @@ async function createJWT(userId: string, workspaceId: string): Promise<string> {
     .sign(secret)
 }
 
-/** Detect currency from Accept-Language header */
-function detectCurrency(acceptLanguage: string | undefined): SupportedCurrency {
-  if (!acceptLanguage) return "USD"
-  const lang = acceptLanguage.toLowerCase()
-  if (lang.includes("hi") || lang.includes("en-in") || lang.includes("ta") || lang.includes("te") || lang.includes("mr")) {
-    return "INR"
-  }
-  if (lang.includes("de") || lang.includes("fr") || lang.includes("es") || lang.includes("it") || lang.includes("nl") || lang.includes("pt")) {
-    return "EUR"
-  }
-  return "USD"
-}
 

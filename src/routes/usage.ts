@@ -30,7 +30,7 @@ usageRoutes.get("/", async (c) => {
 
   return c.json({
     period: { start: monthStart.toISOString(), end: now.toISOString() },
-    cost: (result?.totalCost ?? 0) / 1_000_000, // Convert micro-paise to INR
+    cost: (result?.totalCost ?? 0) / 1_000_000, // Convert micro-units to USD
     tokens: {
       input: result?.totalInputTokens ?? 0,
       output: result?.totalOutputTokens ?? 0,

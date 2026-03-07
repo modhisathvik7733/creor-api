@@ -1,14 +1,12 @@
-/** Supported billing currencies */
-export type SupportedCurrency = "USD" | "INR"
+/** Billing currency — USD only */
+export type SupportedCurrency = "USD"
 
 /** 1 unit of currency = 1,000,000 micro-units */
 export const MICRO = 1_000_000
 
-/** Currency display symbols */
-export const SYMBOL: Record<SupportedCurrency, string> = {
-  USD: "$",
-  INR: "₹",
-}
+/** Display symbol */
+export const SYMBOL = "$"
+export const CURRENCY = "USD"
 
 /** Convert micro-units to display value (e.g. 1500000 → 1.50) */
 export const microToDisplay = (micro: bigint | number): number =>
@@ -19,29 +17,14 @@ export const displayToMicro = (display: number): number =>
   Math.round(display * MICRO)
 
 /**
- * Convert micro-units to smallest currency unit (cents/paise).
+ * Convert micro-units to smallest currency unit (cents).
  * 1 micro-unit = 1/1,000,000 of a unit.
- * 1 smallest unit = 1/100 of a unit.
+ * 1 cent = 1/100 of a unit.
  * So: smallest = micro / 10,000.
  */
 export const microToSmallest = (micro: bigint | number): number =>
   Math.round(Number(micro) / 10_000)
 
-/** Convert smallest currency unit (cents/paise) to micro-units */
+/** Convert smallest currency unit (cents) to micro-units */
 export const smallestToMicro = (smallest: number): number =>
   smallest * 10_000
-
-/** Convert a USD cost to workspace micro-units using exchange rates */
-export function usdToWorkspaceMicro(
-  usd: number,
-  rates: Record<string, number>,
-  currency: SupportedCurrency,
-): number {
-  const rate = rates[currency] ?? 1
-  return Math.round(usd * rate * MICRO)
-}
-
-/** Check if a currency string is a supported currency */
-export function isSupportedCurrency(c: string): c is SupportedCurrency {
-  return c === "USD" || c === "INR"
-}

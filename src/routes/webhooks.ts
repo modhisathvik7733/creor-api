@@ -1,8 +1,8 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
 import { billing, subscriptions, webhookEvents, payments, plans } from "../db/schema.ts"
-import { eq, and, sql } from "drizzle-orm"
-import { verifyCashfreeWebhookSignature } from "../lib/cashfree.ts"
+import { eq, and, isNull, sql } from "drizzle-orm"
+import { verifyWebhookSignature, type LSWebhookEvent } from "../lib/lemonsqueezy.ts"
 import { createId } from "../lib/id.ts"
 
 export const webhookRoutes = new Hono()
@@ -21,109 +21,105 @@ async function claimEvent(eventId: string, eventType: string): Promise<boolean> 
   }
 }
 
-// ── Cashfree webhook handler ──
+// ── Lemon Squeezy webhook handler ──
 
-webhookRoutes.post("/cashfree", async (c) => {
-  const body = await c.req.text()
-  const signature = c.req.header("x-webhook-signature")
-  const timestamp = c.req.header("x-webhook-timestamp")
+webhookRoutes.post("/lemonsqueezy", async (c) => {
+  const rawBody = await c.req.text()
+  const signature = c.req.header("x-signature") ?? ""
 
-  if (!signature || !timestamp || !(await verifyCashfreeWebhookSignature(body, timestamp, signature))) {
+  if (!verifyWebhookSignature(rawBody, signature)) {
     return c.json({ error: "Invalid signature" }, 400)
   }
 
-  const event = JSON.parse(body) as CashfreeWebhookEvent
+  const eventName = c.req.header("x-event-name") ?? ""
+  const event = JSON.parse(rawBody) as LSWebhookEvent
+  const customData = event.meta?.custom_data ?? {}
 
-  // Idempotency: derive a unique event key
-  const entityId =
-    event.data?.subscription?.subscription_id ??
-    event.data?.order?.order_id ??
-    "unknown"
-  const eventKey = `${event.type}:${entityId}`
+  // Idempotency key
+  const entityId = event.data?.id ?? "unknown"
+  const eventKey = `${eventName}:${entityId}`
 
-  if (!(await claimEvent(eventKey, event.type))) {
+  if (!(await claimEvent(eventKey, eventName))) {
     return c.json({ status: "ok", note: "duplicate" })
   }
 
-  switch (event.type) {
-    case "PAYMENT_SUCCESS_WEBHOOK": {
+  switch (eventName) {
+    case "order_created": {
       // One-time payment (credits) completed
-      const order = event.data?.order
-      if (!order) break
+      if (customData.type !== "credits") break
 
-      const orderId = order.order_id
-      const tags = order.order_tags ?? {}
-      const workspaceId = tags.workspaceId
-      const type = tags.type ?? "credits"
+      const workspaceId = customData.workspaceId
+      const userId = customData.userId
+      const usdAmount = parseFloat(customData.usdAmount ?? "0")
 
-      if (!workspaceId) break
+      if (!workspaceId || usdAmount <= 0) break
 
-      // Record payment history (idempotent via unique cashfree_payment_id)
-      try {
-        await db.insert(payments).values({
-          id: createId("pay"),
-          workspaceId,
-          userId: tags.userId ?? null,
-          type: type as "credits" | "subscription",
-          amountSmallest: Math.round((order.order_amount ?? 0) * 100), // display → smallest
-          currency: order.order_currency ?? "INR",
-          cashfreeOrderId: orderId,
-          cashfreePaymentId: event.data?.payment?.cf_payment_id ?? `cf_${orderId}`,
-          status: "captured",
-          metadata: { tags },
-        })
-      } catch {
-        // Unique constraint on cashfree_payment_id = already recorded
-      }
-
-      if (type === "credits") {
-        const creditMicro = Math.round((order.order_amount ?? 0) * 100) * 10_000
-        await db
-          .update(billing)
-          .set({
-            balance: sql`${billing.balance} + ${creditMicro}`,
-            timeUpdated: new Date(),
-          })
-          .where(eq(billing.workspaceId, workspaceId))
-      }
-      break
-    }
-
-    case "SUBSCRIPTION_NEW_ACTIVATION": {
-      // Subscription activated — full plan price was charged upfront
-      const sub = event.data?.subscription
-      if (!sub) break
-
-      const tags = sub.subscription_tags ?? {}
-      const workspaceId = tags.workspaceId
-      const userId = tags.userId
-      const plan = tags.plan as "starter" | "pro" | "team"
-
-      if (!workspaceId || !userId || !plan) break
-
-      await db.insert(subscriptions).values({
-        id: createId("sub"),
-        workspaceId,
-        userId,
-        plan,
-        cashfreeSubscriptionId: sub.subscription_id,
-      }).onConflictDoNothing()
-
+      // Credit balance: USD amount → micro-units
+      const creditMicro = Math.round(usdAmount * 100) * 10_000
       await db
         .update(billing)
         .set({
-          cashfreeSubscriptionId: sub.subscription_id,
+          balance: sql`${billing.balance} + ${creditMicro}`,
           timeUpdated: new Date(),
         })
         .where(eq(billing.workspaceId, workspaceId))
 
-      // Record the upfront subscription payment in history
-      const planRow = await db.select().from(plans).where(eq(plans.id, plan)).then((r) => r[0])
-      const bill = await db.select().from(billing).where(eq(billing.workspaceId, workspaceId)).then((r) => r[0])
-      if (planRow && bill) {
-        const currency = bill.currency ?? "INR"
-        const prices = planRow.prices as Record<string, number> | null
-        const amountSmallest = prices?.[currency] ?? 0
+      // Record payment
+      try {
+        await db.insert(payments).values({
+          id: createId("pay"),
+          workspaceId,
+          userId: userId ?? null,
+          type: "credits",
+          amountSmallest: Math.round(usdAmount * 100), // USD cents
+          currency: "USD",
+          lsOrderId: String(entityId),
+          status: "captured",
+          metadata: { customData },
+        })
+      } catch {
+        // Unique constraint — already recorded
+      }
+
+      break
+    }
+
+    case "subscription_created": {
+      // New subscription activated
+      const workspaceId = customData.workspaceId
+      const userId = customData.userId
+      const planId = customData.plan as "starter" | "pro" | "team" | undefined
+
+      if (!workspaceId || !userId || !planId) break
+
+      const lsSubscriptionId = String(entityId)
+      const attrs = event.data.attributes as Record<string, unknown>
+      const customerId = attrs.customer_id ? String(attrs.customer_id) : null
+
+      // Create subscription record
+      await db.insert(subscriptions).values({
+        id: createId("sub"),
+        workspaceId,
+        userId,
+        plan: planId,
+        lsSubscriptionId,
+      }).onConflictDoNothing()
+
+      // Update billing record
+      await db
+        .update(billing)
+        .set({
+          lsSubscriptionId,
+          lsCustomerId: customerId,
+          timeUpdated: new Date(),
+        })
+        .where(eq(billing.workspaceId, workspaceId))
+
+      // Record subscription payment
+      const plan = await db.select().from(plans).where(eq(plans.id, planId)).then((r) => r[0])
+      if (plan) {
+        const prices = plan.prices as Record<string, number> | null
+        const amountSmallest = prices?.["USD"] ?? 0
         try {
           await db.insert(payments).values({
             id: createId("pay"),
@@ -131,100 +127,159 @@ webhookRoutes.post("/cashfree", async (c) => {
             userId,
             type: "subscription",
             amountSmallest,
-            currency,
-            cashfreePaymentId: `sub_upfront_${sub.subscription_id}`,
+            currency: "USD",
+            lsOrderId: `sub_${lsSubscriptionId}`,
             status: "captured",
-            metadata: { subscriptionId: sub.subscription_id, plan },
+            metadata: { subscriptionId: lsSubscriptionId, plan: planId },
           })
         } catch {
-          // Unique constraint — already recorded (e.g. by activate-subscription endpoint)
+          // Already recorded
         }
       }
 
       break
     }
 
-    case "SUBSCRIPTION_PAYMENT_SUCCESS": {
-      // Recurring subscription payment succeeded
-      const sub = event.data?.subscription
-      if (!sub) break
+    case "subscription_updated": {
+      // Plan change or billing update
+      const lsSubscriptionId = String(entityId)
+      const attrs = event.data.attributes as Record<string, unknown>
+      const variantId = attrs.variant_id ? String(attrs.variant_id) : null
 
-      const tags = sub.subscription_tags ?? {}
-      const workspaceId = tags.workspaceId
+      if (!variantId) break
 
-      if (!workspaceId) break
-
-      // If there's a pending plan change, apply it now (downgrade at cycle end)
-      const existingSub = await db
+      // Look up which plan corresponds to this variant
+      const matchingPlan = await db
         .select()
-        .from(subscriptions)
-        .where(eq(subscriptions.cashfreeSubscriptionId, sub.subscription_id))
+        .from(plans)
+        .where(eq(plans.lsVariantId, variantId))
         .then((r) => r[0])
 
-      if (existingSub?.pendingPlan) {
+      if (matchingPlan) {
         await db
           .update(subscriptions)
-          .set({
-            plan: existingSub.pendingPlan as "starter" | "pro" | "team",
-            pendingPlan: null,
-            pendingPlanEffectiveAt: null,
-          })
-          .where(eq(subscriptions.id, existingSub.id))
+          .set({ plan: matchingPlan.id as "starter" | "pro" | "team" })
+          .where(and(
+            eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
+            isNull(subscriptions.timeDeleted),
+          ))
       }
 
       break
     }
 
-    case "SUBSCRIPTION_STATUS_CHANGE": {
-      // Subscription status changed (activated, cancelled, completed, expired)
-      const sub = event.data?.subscription
-      if (!sub) break
+    case "subscription_cancelled": {
+      // User cancelled — enters grace period
+      const lsSubscriptionId = String(entityId)
+      const attrs = event.data.attributes as Record<string, unknown>
+      const endsAt = attrs.ends_at ? new Date(attrs.ends_at as string) : null
 
-      const status = sub.subscription_status
-      const tags = sub.subscription_tags ?? {}
-      const workspaceId = tags.workspaceId
+      await db
+        .update(subscriptions)
+        .set({ graceUntil: endsAt })
+        .where(and(
+          eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
+          isNull(subscriptions.timeDeleted),
+        ))
 
-      if (!workspaceId) break
+      break
+    }
 
-      if (status === "ACTIVE") {
-        // Treat as activation (same logic as SUBSCRIPTION_NEW_ACTIVATION)
-        const userId = tags.userId
-        const plan = tags.plan as "starter" | "pro" | "team"
-        if (userId && plan) {
-          await db.insert(subscriptions).values({
-            id: createId("sub"),
-            workspaceId,
-            userId,
-            plan,
-            cashfreeSubscriptionId: sub.subscription_id,
-          }).onConflictDoNothing()
+    case "subscription_expired": {
+      // Grace period over — deactivate
+      const lsSubscriptionId = String(entityId)
 
-          await db
-            .update(billing)
-            .set({
-              cashfreeSubscriptionId: sub.subscription_id,
-              timeUpdated: new Date(),
-            })
-            .where(eq(billing.workspaceId, workspaceId))
+      await db
+        .update(subscriptions)
+        .set({ timeDeleted: new Date() })
+        .where(and(
+          eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
+          isNull(subscriptions.timeDeleted),
+        ))
+
+      // Clear billing subscription ID if it still points to this subscription
+      await db
+        .update(billing)
+        .set({
+          lsSubscriptionId: null,
+          timeUpdated: new Date(),
+        })
+        .where(eq(billing.lsSubscriptionId, lsSubscriptionId))
+
+      break
+    }
+
+    case "subscription_payment_success": {
+      // Recurring charge succeeded — record payment
+      const attrs = event.data.attributes as Record<string, unknown>
+      const lsSubscriptionId = attrs.subscription_id ? String(attrs.subscription_id) : null
+
+      if (!lsSubscriptionId) break
+
+      const sub = await db
+        .select()
+        .from(subscriptions)
+        .where(and(
+          eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
+          isNull(subscriptions.timeDeleted),
+        ))
+        .then((r) => r[0])
+
+      if (sub) {
+        const plan = await db.select().from(plans).where(eq(plans.id, sub.plan)).then((r) => r[0])
+        const prices = plan?.prices as Record<string, number> | null
+        const amountSmallest = prices?.["USD"] ?? 0
+
+        try {
+          await db.insert(payments).values({
+            id: createId("pay"),
+            workspaceId: sub.workspaceId,
+            userId: sub.userId,
+            type: "subscription",
+            amountSmallest,
+            currency: "USD",
+            lsSubscriptionPaymentId: String(entityId),
+            status: "captured",
+            metadata: { subscriptionId: lsSubscriptionId, plan: sub.plan },
+          })
+        } catch {
+          // Already recorded
         }
-      } else if (status === "CANCELLED" || status === "COMPLETED" || status === "EXPIRED") {
-        await db
-          .update(subscriptions)
-          .set({ timeDeleted: new Date() })
-          .where(eq(subscriptions.cashfreeSubscriptionId, sub.subscription_id))
+      }
 
-        // Only clear billing's subscription ID if it still points to THIS subscription.
-        // During upgrades, the old sub is cancelled but a new one may already be active.
+      break
+    }
+
+    case "subscription_payment_failed": {
+      // Recurring charge failed — log for now
+      console.warn(`[webhook] subscription_payment_failed: ${entityId}`)
+      break
+    }
+
+    case "order_refunded": {
+      // Credits refunded — deduct from balance
+      const lsOrderId = String(entityId)
+
+      const payment = await db
+        .select()
+        .from(payments)
+        .where(eq(payments.lsOrderId, lsOrderId))
+        .then((r) => r[0])
+
+      if (payment && payment.type === "credits" && payment.status === "captured") {
+        const debitMicro = payment.amountSmallest * 10_000
         await db
           .update(billing)
           .set({
-            cashfreeSubscriptionId: null,
+            balance: sql`GREATEST(${billing.balance} - ${debitMicro}, 0)`,
             timeUpdated: new Date(),
           })
-          .where(and(
-            eq(billing.workspaceId, workspaceId),
-            eq(billing.cashfreeSubscriptionId, sub.subscription_id),
-          ))
+          .where(eq(billing.workspaceId, payment.workspaceId))
+
+        await db
+          .update(payments)
+          .set({ status: "refunded" })
+          .where(eq(payments.id, payment.id))
       }
 
       break
@@ -233,29 +288,3 @@ webhookRoutes.post("/cashfree", async (c) => {
 
   return c.json({ status: "ok" })
 })
-
-// ── Types ──
-
-interface CashfreeWebhookEvent {
-  type: string
-  data: {
-    order?: {
-      order_id: string
-      order_amount: number
-      order_currency: string
-      order_tags: Record<string, string>
-    }
-    payment?: {
-      cf_payment_id: string
-      payment_status: string
-      payment_amount: number
-    }
-    subscription?: {
-      subscription_id: string
-      cf_subscription_id: string
-      subscription_status: string
-      subscription_tags: Record<string, string>
-      plan_details?: { plan_id: string }
-    }
-  }
-}

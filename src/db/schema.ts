@@ -46,8 +46,8 @@ export const users = pgTable(
     authProvider: text("auth_provider", { enum: ["github", "google"] }).notNull(),
     authProviderId: text("auth_provider_id").notNull(),
     avatarUrl: text("avatar_url"),
-    monthlyLimit: integer("monthly_limit"), // in INR (paise)
-    monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // in micro-paise
+    monthlyLimit: integer("monthly_limit"), // in USD (cents)
+    monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // in micro-units
     timeMonthlyUsageUpdated: timestamp("time_monthly_usage_updated"),
     timeCreated: timestamp("time_created").defaultNow().notNull(),
     timeUpdated: timestamp("time_updated").defaultNow().notNull(),
@@ -107,17 +107,13 @@ export const billing = pgTable("billing", {
     .references(() => workspaces.id)
     .unique(),
   balance: bigint("balance", { mode: "number" }).notNull().default(0), // micro-units (1 currency unit = 1,000,000)
-  currency: text("currency").notNull().default("INR"), // USD | INR | EUR
-  monthlyLimit: integer("monthly_limit"), // legacy INR — use plans.monthly_limit instead
+  currency: text("currency").notNull().default("USD"),
+  monthlyLimit: integer("monthly_limit"),
   monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // micro-units
   timeMonthlyReset: timestamp("time_monthly_reset").defaultNow(), // lazy reset at month boundary
   timeMonthlyUsageUpdated: timestamp("time_monthly_usage_updated"),
-  cashfreeCustomerId: text("cashfree_customer_id"),
-  cashfreeSubscriptionId: text("cashfree_subscription_id"),
-  reloadEnabled: boolean("reload_enabled").default(false),
-  reloadAmount: integer("reload_amount").default(500),
-  reloadTrigger: integer("reload_trigger").default(100),
-  timeReloadLockedTill: timestamp("time_reload_locked_till"),
+  lsCustomerId: text("ls_customer_id"),
+  lsSubscriptionId: text("ls_subscription_id"),
   timeCreated: timestamp("time_created").defaultNow().notNull(),
   timeUpdated: timestamp("time_updated").defaultNow().notNull(),
 })
@@ -142,7 +138,7 @@ export const subscriptions = pgTable(
       .notNull()
       .references(() => users.id),
     plan: text("plan", { enum: ["starter", "pro", "team"] }).notNull(),
-    cashfreeSubscriptionId: text("cashfree_subscription_id"),
+    lsSubscriptionId: text("ls_subscription_id"),
     rollingUsage: bigint("rolling_usage", { mode: "number" }).default(0),
     fixedUsage: bigint("fixed_usage", { mode: "number" }).default(0),
     timeRollingUpdated: timestamp("time_rolling_updated"),
@@ -292,11 +288,11 @@ export const models = pgTable("models", {
 export const plans = pgTable("plans", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
-  prices: jsonb("prices").notNull().default({}), // {"USD": 999, "INR": 49900, "EUR": 549} smallest unit
+  prices: jsonb("prices").notNull().default({}), // {"USD": 999} smallest unit (cents)
   monthlyLimit: bigint("monthly_limit", { mode: "number" }), // micro-units (USD-equivalent)
   onboardingCredits: bigint("onboarding_credits", { mode: "number" }).default(0),
   features: jsonb("features").default([]),
-  cashfreePlanIds: jsonb("cashfree_plan_ids").default({}), // {"USD": "plan_xxx", "INR": "plan_yyy"}
+  lsVariantId: text("ls_variant_id"), // Lemon Squeezy variant ID
   enabled: boolean("enabled").notNull().default(true),
   sortOrder: integer("sort_order").default(0),
   timeCreated: timestamp("time_created").defaultNow().notNull(),
@@ -325,8 +321,8 @@ export const payments = pgTable(
     type: text("type", { enum: ["credits", "subscription", "onboarding", "refund"] }).notNull(),
     amountSmallest: integer("amount_smallest").notNull(), // cents/paise
     currency: text("currency").notNull().default("USD"),
-    cashfreeOrderId: text("cashfree_order_id"),
-    cashfreePaymentId: text("cashfree_payment_id").unique(),
+    lsOrderId: text("ls_order_id"),
+    lsSubscriptionPaymentId: text("ls_subscription_payment_id"),
     status: text("status", { enum: ["created", "captured", "failed", "refunded"] })
       .notNull()
       .default("created"),
@@ -335,7 +331,7 @@ export const payments = pgTable(
   },
   (table) => [
     index("payments_workspace_idx").on(table.workspaceId),
-    index("payments_cashfree_order_idx").on(table.cashfreeOrderId),
+    index("payments_ls_order_idx").on(table.lsOrderId),
   ],
 )
 

@@ -3,8 +3,7 @@ import { db } from "../db/client.ts"
 import { keys, billing, usage, subscriptions, plans } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
-import { MICRO, microToDisplay, usdToWorkspaceMicro } from "../lib/currency.ts"
-import type { SupportedCurrency } from "../lib/currency.ts"
+import { MICRO, microToDisplay } from "../lib/currency.ts"
 
 export const gatewayRoutes = new Hono()
 
@@ -71,27 +70,20 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       ? 0
       : (bill.monthlyUsage ?? 0)
 
-  // Fetch exchange rates for currency conversion
-  const exchangeRates = await getExchangeRates()
-  const currency = bill.currency as SupportedCurrency
-  const rate = exchangeRates[currency] ?? 1
-
   // Determine effective plan limit
   const userPlan = hasSubscription
     ? await db.select().from(plans).where(eq(plans.id, sub!.plan)).then((r) => r[0])
     : await db.select().from(plans).where(eq(plans.id, "free")).then((r) => r[0])
 
-  // Plan limit is in USD micro-units → convert to workspace currency
-  const planLimitLocal = userPlan?.monthlyLimit
-    ? Math.round(userPlan.monthlyLimit * rate)
-    : Math.round(500000 * rate) // fallback free tier $0.50
+  // Plan limit in USD micro-units
+  const planLimitMicro = userPlan?.monthlyLimit ?? 500000 // fallback free tier $0.50
 
-  // Workspace override (legacy: monthlyLimit is in INR units → convert to micro-units)
+  // Workspace override (monthlyLimit is in USD units → convert to micro-units)
   const workspaceLimitMicro = bill.monthlyLimit
     ? bill.monthlyLimit * MICRO
     : null
 
-  const effectiveLimit = workspaceLimitMicro ?? planLimitLocal
+  const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
 
   // Block if over plan limit AND no credits for overage
   if (effectiveLimit !== null && monthlyUsage >= effectiveLimit && bill.balance <= 0) {
@@ -189,9 +181,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       provider: providerConfig.provider,
       inputCost,
       outputCost,
-      exchangeRates,
-      currency,
-      planLimitLocal: effectiveLimit,
+      planLimit: effectiveLimit,
     }
 
     // Return response (stream-through for SSE)
@@ -291,23 +281,7 @@ interface CostContext {
   provider: string
   inputCost: number // USD per 1K tokens
   outputCost: number // USD per 1K tokens
-  exchangeRates: Record<string, number>
-  currency: SupportedCurrency
-  planLimitLocal: number | null // plan limit in workspace currency micro-units
-}
-
-/** Get exchange rates from system_config (cached in materialized view) */
-async function getExchangeRates(): Promise<Record<string, number>> {
-  const row = await db
-    .execute(sql`SELECT exchange_rates FROM gateway_config LIMIT 1`)
-    .then((r) => r[0])
-  if (row?.exchange_rates) {
-    return typeof row.exchange_rates === "string"
-      ? JSON.parse(row.exchange_rates) as Record<string, number>
-      : row.exchange_rates as Record<string, number>
-  }
-  // Hardcoded fallback (should never happen if migrations ran)
-  return { USD: 1, INR: 85, EUR: 0.92 }
+  planLimit: number | null // plan limit in USD micro-units
 }
 
 async function trackUsageAsync(
@@ -326,17 +300,14 @@ async function trackUsageAsync(
 
   if (inputTokens === 0 && outputTokens === 0) return
 
-  // Cost in USD
+  // Cost in USD micro-units
   const costUSD = (inputTokens * ctx.inputCost + outputTokens * ctx.outputCost) / 1_000
-  const costUsdMicro = Math.round(costUSD * MICRO)
-
-  // Cost in workspace currency (micro-units)
-  const costMicro = usdToWorkspaceMicro(costUSD, ctx.exchangeRates, ctx.currency)
+  const costMicro = Math.round(costUSD * MICRO)
 
   try {
     // Atomic: increment monthly counter + deduct overage from balance
     await db.execute(
-      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.planLimitLocal})`,
+      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.planLimit})`,
     )
 
     // Insert usage row
@@ -349,7 +320,7 @@ async function trackUsageAsync(
       inputTokens,
       outputTokens,
       cost: costMicro,
-      costUsd: costUsdMicro,
+      costUsd: costMicro,
     })
   } catch (err) {
     console.error("Failed to track usage:", err)
