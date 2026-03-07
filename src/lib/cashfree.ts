@@ -124,7 +124,7 @@ export async function createCashfreePlan(params: {
  * 2. authorization_amount = full plan price (kept, not refunded) — this IS the first month's payment
  * 3. subscription_first_charge_time = 1 month later — recurring charges start after the prepaid month
  *
- * Cashfree shows all available payment methods (UPI, cards, etc.) automatically.
+ * payment_methods explicitly set to ["card", "upi"] so checkout shows both options.
  */
 export async function createCashfreeSubscription(params: {
   subscriptionId: string
@@ -137,11 +137,12 @@ export async function createCashfreeSubscription(params: {
   tags?: Record<string, string>
 }) {
   // Charge the full plan price as the authorization amount (covers first month).
-  // Don't restrict payment_methods — let Cashfree show all available options
-  // (UPI, cards, net banking, etc.) based on account configuration.
+  // Explicitly list payment methods so checkout shows card + UPI options.
+  // Valid values: "card" (standing instructions), "upi" (autopay), "enach", "pnach"
   const authDetails = {
     authorization_amount: params.planAmount,
     authorization_amount_refund: false,
+    payment_methods: ["card", "upi"],
   }
 
   // First recurring charge = 1 month from now (upfront auth covers the first month).
