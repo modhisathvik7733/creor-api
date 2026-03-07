@@ -173,8 +173,9 @@ export async function createCashfreeSubscription(params: {
         customer_phone: params.customerPhone,
       },
       // Inline plan details — no plan_id reference needed
+      // Cashfree only allows alphanumeric + few special chars in plan_name
       plan_details: {
-        plan_name: params.planName,
+        plan_name: params.planName.replace(/[^a-zA-Z0-9 _\-]/g, "").slice(0, 40),
         plan_type: "PERIODIC",
         plan_currency: currency,
         plan_amount: params.planAmount,
