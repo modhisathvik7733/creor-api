@@ -19,7 +19,6 @@
     "@hono/zod-validator": "^0.4.2",
     "drizzle-orm": "^0.38.0",
     "postgres": "^3.4.5",
-    "razorpay": "^2.9.5",
     "zod": "^3.24.0",
     "ulid": "^2.3.0",
     "jose": "^6.0.0"

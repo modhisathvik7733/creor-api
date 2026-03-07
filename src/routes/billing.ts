@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createRazorpayOrder, createRazorpayPlan, createRazorpaySubscription, fetchRazorpaySubscription, verifyPaymentSignature, updateRazorpaySubscription, cancelRazorpaySubscriptionAtCycleEnd } from "../lib/razorpay.ts"
+import { createCashfreeOrder, getCashfreeOrderStatus, createCashfreePlan, createCashfreeSubscription, fetchCashfreeSubscription, manageCashfreeSubscription } from "../lib/cashfree.ts"
 import { createId } from "../lib/id.ts"
 import {
   MICRO,
@@ -201,7 +201,7 @@ billingRoutes.get("/quota", async (c) => {
   })
 })
 
-// ── Add credits (multi-currency Razorpay order) ──
+// ── Add credits (multi-currency Cashfree order) ──
 
 const addCreditsSchema = z.object({
   amount: z.number().min(1).max(50000), // in display currency units
@@ -221,14 +221,20 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
 
   const currency = bill.currency as SupportedCurrency
   const amountSmallest = Math.round(amount * 100) // display units → cents/paise
+  const orderId = `credits_${auth.workspaceId}_${Date.now()}`
 
-  const order = await createRazorpayOrder({
-    amount: amountSmallest,
+  const order = await createCashfreeOrder({
+    orderId,
+    amount, // Cashfree takes display units (decimal)
     currency,
-    receipt: `credits_${auth.workspaceId}_${Date.now()}`,
+    customerEmail: auth.email,
+    customerPhone: "9999999999", // placeholder — Cashfree requires phone
+    customerId: auth.userId,
+    notifyUrl: "https://api.creor.ai/api/webhooks/cashfree",
     notes: {
       workspaceId: auth.workspaceId,
       type: "credits",
+      userId: auth.userId,
     },
   })
 
@@ -240,53 +246,47 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
     type: "credits",
     amountSmallest,
     currency,
-    razorpayOrderId: order.id,
+    cashfreeOrderId: orderId,
     status: "created",
   })
 
   return c.json({
-    orderId: order.id,
+    orderId,
+    paymentSessionId: order.payment_session_id,
     amount,
-    amountSmallest,
     currency,
     symbol: SYMBOL[currency] ?? "$",
-    keyId: process.env.RAZORPAY_KEY_ID ?? "",
   })
 })
 
 // ── Verify payment and credit balance instantly ──
 
 const verifyPaymentSchema = z.object({
-  razorpay_order_id: z.string(),
-  razorpay_payment_id: z.string(),
-  razorpay_signature: z.string(),
+  orderId: z.string(),
 })
 
 billingRoutes.post("/verify-payment", requireAdmin, zValidator("json", verifyPaymentSchema), async (c) => {
   const auth = c.get("auth")
-  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = c.req.valid("json")
+  const { orderId } = c.req.valid("json")
 
-  const valid = await verifyPaymentSignature({
-    orderId: razorpay_order_id,
-    paymentId: razorpay_payment_id,
-    signature: razorpay_signature,
-  })
+  // Server-side verification: check order status with Cashfree
+  const orderStatus = await getCashfreeOrderStatus(orderId)
 
-  if (!valid) {
-    return c.json({ error: "Invalid payment signature" }, 400)
+  if (orderStatus.order_status !== "PAID") {
+    return c.json({ error: `Payment not completed. Status: ${orderStatus.order_status}` }, 400)
   }
 
   // Update payment record
   await db
     .update(payments)
-    .set({ razorpayPaymentId: razorpay_payment_id, status: "captured" })
-    .where(eq(payments.razorpayOrderId, razorpay_order_id))
+    .set({ cashfreePaymentId: `cf_${orderStatus.cf_order_id}`, status: "captured" })
+    .where(eq(payments.cashfreeOrderId, orderId))
 
   // Credit balance from the payment record
   const payment = await db
     .select()
     .from(payments)
-    .where(eq(payments.razorpayOrderId, razorpay_order_id))
+    .where(eq(payments.cashfreeOrderId, orderId))
     .then((r) => r[0])
 
   if (payment && payment.type === "credits") {
@@ -301,7 +301,7 @@ billingRoutes.post("/verify-payment", requireAdmin, zValidator("json", verifyPay
       .where(eq(billing.workspaceId, auth.workspaceId))
   }
 
-  return c.json({ success: true, paymentId: razorpay_payment_id })
+  return c.json({ success: true, paymentId: orderStatus.cf_order_id })
 })
 
 // ── Subscribe (multi-currency) ──
@@ -333,27 +333,30 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
   if (!plan) return c.json({ error: "Plan not found" }, 400)
 
-  // Get Razorpay plan ID for this currency (auto-create if missing)
-  const razorpayPlanIds = plan.razorpayPlanIds as Record<string, string> | null
-  let razorpayPlanId = razorpayPlanIds?.[currency]
+  // Get Cashfree plan ID for this currency (auto-create if missing)
+  const cashfreePlanIds = plan.cashfreePlanIds as Record<string, string> | null
+  let cashfreePlanId = cashfreePlanIds?.[currency]
 
-  if (!razorpayPlanId) {
+  if (!cashfreePlanId) {
     const prices = plan.prices as Record<string, number> | null
     const priceSmallest = prices?.[currency]
     if (!priceSmallest) {
       return c.json({ error: `Plan ${planId} not available in ${currency}` }, 400)
     }
+    const priceDisplay = priceSmallest / 100 // smallest → display units
+    const cfPlanId = `creor_${planId}_${currency.toLowerCase()}`
     try {
-      const rzPlan = await createRazorpayPlan({
+      await createCashfreePlan({
+        planId: cfPlanId,
         name: `Creor ${plan.name} (${currency})`,
-        amount: priceSmallest,
+        amount: priceDisplay,
         currency,
-        description: `Creor ${plan.name} plan`,
-        period: "monthly",
+        intervalType: "MONTH",
+        intervals: 1,
       })
-      razorpayPlanId = rzPlan.id
+      cashfreePlanId = cfPlanId
       await db.update(plans).set({
-        razorpayPlanIds: { ...(razorpayPlanIds ?? {}), [currency]: rzPlan.id },
+        cashfreePlanIds: { ...(cashfreePlanIds ?? {}), [currency]: cfPlanId },
         timeUpdated: new Date(),
       }).where(eq(plans.id, planId))
     } catch (err) {
@@ -362,10 +365,13 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
   }
 
   try {
-    const subscription = await createRazorpaySubscription({
-      planId: razorpayPlanId,
-      totalCount: 12,
-      notes: {
+    const subscriptionId = `sub_${auth.workspaceId}_${Date.now()}`
+    const subscription = await createCashfreeSubscription({
+      subscriptionId,
+      planId: cashfreePlanId,
+      customerEmail: auth.email,
+      customerPhone: "9999999999", // placeholder — Cashfree requires phone
+      tags: {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
         plan: planId,
@@ -376,14 +382,14 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     const price = prices?.[currency] ? (prices[currency] as number) / 100 : 0
 
     return c.json({
-      subscriptionId: subscription.id,
+      subscriptionId: subscription.subscription_id,
+      paymentSessionId: subscription.subscription_session_id,
       plan: planId,
       price,
       currency,
-      keyId: process.env.RAZORPAY_KEY_ID ?? "",
     })
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Razorpay subscription creation failed"
+    const message = err instanceof Error ? err.message : "Cashfree subscription creation failed"
     return c.json({ error: message }, 500)
   }
 })
@@ -402,32 +408,33 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
   const existing = await db
     .select()
     .from(subscriptions)
-    .where(eq(subscriptions.razorpaySubscriptionId, subscriptionId))
+    .where(eq(subscriptions.cashfreeSubscriptionId, subscriptionId))
     .then((r) => r[0])
 
   if (existing && !existing.timeDeleted) {
     return c.json({ success: true, status: "already_active" })
   }
 
-  // Verify with Razorpay that the subscription is actually active
-  let rzSub: { id: string; plan_id: string; status: string; notes: Record<string, string> }
+  // Verify with Cashfree that the subscription is actually active
+  let cfSub: Awaited<ReturnType<typeof fetchCashfreeSubscription>>
   try {
-    rzSub = await fetchRazorpaySubscription(subscriptionId)
+    cfSub = await fetchCashfreeSubscription(subscriptionId)
   } catch {
-    return c.json({ error: "Could not verify subscription with Razorpay" }, 400)
+    return c.json({ error: "Could not verify subscription with Cashfree" }, 400)
   }
 
-  if (rzSub.status !== "active" && rzSub.status !== "authenticated") {
-    return c.json({ error: `Subscription status is "${rzSub.status}", not active` }, 400)
+  if (cfSub.subscription_status !== "ACTIVE" && cfSub.subscription_status !== "INITIALIZED") {
+    return c.json({ error: `Subscription status is "${cfSub.subscription_status}", not active` }, 400)
   }
 
-  // Verify this subscription belongs to this workspace
-  const workspaceId = rzSub.notes?.workspaceId
+  // Read plan from subscription tags
+  const tags = cfSub.subscription_tags ?? {}
+  const workspaceId = tags.workspaceId
   if (workspaceId && workspaceId !== auth.workspaceId) {
     return c.json({ error: "Subscription does not belong to this workspace" }, 403)
   }
 
-  const planId = rzSub.notes?.plan as string | undefined
+  const planId = tags.plan as string | undefined
   if (!planId) {
     return c.json({ error: "Subscription missing plan info" }, 400)
   }
@@ -438,7 +445,7 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
     workspaceId: auth.workspaceId,
     userId: auth.userId,
     plan: planId as "starter" | "pro" | "team",
-    razorpaySubscriptionId: subscriptionId,
+    cashfreeSubscriptionId: subscriptionId,
   }).onConflictDoNothing()
 
   // Update billing record
@@ -451,7 +458,7 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
   await db
     .update(billing)
     .set({
-      razorpaySubscriptionId: subscriptionId,
+      cashfreeSubscriptionId: subscriptionId,
       timeUpdated: new Date(),
     })
     .where(eq(billing.workspaceId, auth.workspaceId))
@@ -470,12 +477,12 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
         type: "subscription",
         amountSmallest,
         currency,
-        razorpayPaymentId: `sub_payment_${subscriptionId}`,
+        cashfreePaymentId: `sub_payment_${subscriptionId}`,
         status: "captured",
         metadata: { subscriptionId, plan: planId },
       })
     } catch {
-      // Unique constraint on razorpay_payment_id — already recorded
+      // Unique constraint on cashfree_payment_id — already recorded
     }
   }
 
@@ -611,14 +618,14 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
     .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
     .then((r) => r[0])
 
-  if (!sub?.razorpaySubscriptionId) {
+  if (!sub?.cashfreeSubscriptionId) {
     return c.json({ error: "No active subscription to change" }, 400)
   }
   if (sub.plan === newPlanId) {
     return c.json({ error: "Already on this plan" }, 400)
   }
 
-  // Get new plan and its Razorpay plan ID
+  // Get new plan and its Cashfree plan ID
   const newPlan = await db.select().from(plans).where(eq(plans.id, newPlanId)).then((r) => r[0])
   if (!newPlan) return c.json({ error: "Plan not found" }, 404)
 
@@ -629,26 +636,29 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
     .then((r) => r[0])
 
   const currency = (bill?.currency ?? "INR") as SupportedCurrency
-  const rzPlanIds = newPlan.razorpayPlanIds as Record<string, string> | null
-  let rzPlanId = rzPlanIds?.[currency]
+  const cfPlanIds = newPlan.cashfreePlanIds as Record<string, string> | null
+  let cfPlanId = cfPlanIds?.[currency]
 
-  if (!rzPlanId) {
+  if (!cfPlanId) {
     const prices = newPlan.prices as Record<string, number> | null
     const priceSmallest = prices?.[currency]
     if (!priceSmallest) {
       return c.json({ error: `Plan ${newPlanId} not available in ${currency}` }, 400)
     }
+    const priceDisplay = priceSmallest / 100
+    const newCfPlanId = `creor_${newPlanId}_${currency.toLowerCase()}`
     try {
-      const rzPlan = await createRazorpayPlan({
+      await createCashfreePlan({
+        planId: newCfPlanId,
         name: `Creor ${newPlan.name} (${currency})`,
-        amount: priceSmallest,
+        amount: priceDisplay,
         currency,
-        description: `Creor ${newPlan.name} plan`,
-        period: "monthly",
+        intervalType: "MONTH",
+        intervals: 1,
       })
-      rzPlanId = rzPlan.id
+      cfPlanId = newCfPlanId
       await db.update(plans).set({
-        razorpayPlanIds: { ...(rzPlanIds ?? {}), [currency]: rzPlan.id },
+        cashfreePlanIds: { ...(cfPlanIds ?? {}), [currency]: newCfPlanId },
         timeUpdated: new Date(),
       }).where(eq(plans.id, newPlanId))
     } catch (err) {
@@ -662,12 +672,12 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
   const newPrice = (newPlan.prices as Record<string, number>)?.[currency] ?? 0
   const isUpgrade = newPrice > currentPrice
 
-  // Call Razorpay
+  // Call Cashfree
   try {
-    await updateRazorpaySubscription({
-      subscriptionId: sub.razorpaySubscriptionId,
-      planId: rzPlanId,
-      scheduleChangeAt: isUpgrade ? "now" : "cycle_end",
+    await manageCashfreeSubscription({
+      subscriptionId: sub.cashfreeSubscriptionId,
+      action: "CHANGE_PLAN",
+      actionDetails: { planId: cfPlanId },
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to change plan"
@@ -686,9 +696,9 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
       .where(eq(subscriptions.id, sub.id))
   } else {
     // Downgrade: store pending, takes effect at cycle end
-    const rzSub = await fetchRazorpaySubscription(sub.razorpaySubscriptionId)
-    const effectiveAt = rzSub.current_end
-      ? new Date(rzSub.current_end * 1000)
+    const cfSub = await fetchCashfreeSubscription(sub.cashfreeSubscriptionId)
+    const effectiveAt = cfSub.next_schedule_date
+      ? new Date(cfSub.next_schedule_date)
       : new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() + 1, 1))
 
     await db
@@ -708,7 +718,7 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
   })
 })
 
-// ── Cancel subscription (at end of billing cycle) ──
+// ── Cancel subscription ──
 
 billingRoutes.post("/cancel-subscription", requireAdmin, async (c) => {
   const auth = c.get("auth")
@@ -718,24 +728,42 @@ billingRoutes.post("/cancel-subscription", requireAdmin, async (c) => {
     .where(and(eq(subscriptions.workspaceId, auth.workspaceId), isNull(subscriptions.timeDeleted)))
     .then((r) => r[0])
 
-  if (!sub?.razorpaySubscriptionId) {
+  if (!sub?.cashfreeSubscriptionId) {
     return c.json({ error: "No active subscription" }, 400)
   }
 
+  // Fetch current period end before cancelling
+  let endsAt: Date | null = null
   try {
-    await cancelRazorpaySubscriptionAtCycleEnd(sub.razorpaySubscriptionId)
+    const cfSub = await fetchCashfreeSubscription(sub.cashfreeSubscriptionId)
+    if (cfSub.next_schedule_date) {
+      endsAt = new Date(cfSub.next_schedule_date)
+    }
+  } catch {
+    // Best effort — continue with cancellation
+  }
+
+  try {
+    await manageCashfreeSubscription({
+      subscriptionId: sub.cashfreeSubscriptionId,
+      action: "CANCEL",
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to cancel subscription"
     return c.json({ error: message }, 500)
   }
 
-  // Fetch cycle end date from Razorpay
-  const rzSub = await fetchRazorpaySubscription(sub.razorpaySubscriptionId)
-  const endsAt = rzSub.current_end ? new Date(rzSub.current_end * 1000) : null
+  // Set grace period until current cycle end
+  if (endsAt) {
+    await db
+      .update(subscriptions)
+      .set({ graceUntil: endsAt })
+      .where(eq(subscriptions.id, sub.id))
+  }
 
   return c.json({
     success: true,
-    message: "Subscription will be cancelled at end of billing cycle.",
+    message: "Subscription cancelled. Access continues until end of current billing cycle.",
     endsAt: endsAt?.toISOString() ?? null,
   })
 })

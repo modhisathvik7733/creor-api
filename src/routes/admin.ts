@@ -101,7 +101,7 @@ const planUpdateSchema = z.object({
   monthlyLimit: z.number().nullable().optional(),
   onboardingCredits: z.number().nullable().optional(),
   features: z.array(z.string()).optional(),
-  razorpayPlanIds: z.record(z.string()).optional(),
+  cashfreePlanIds: z.record(z.string()).optional(),
   enabled: z.boolean().optional(),
   sortOrder: z.number().int().optional(),
 })
@@ -116,7 +116,7 @@ adminRoutes.patch("/plans/:id", zValidator("json", planUpdateSchema), async (c) 
   if (data.monthlyLimit !== undefined) updates.monthlyLimit = data.monthlyLimit
   if (data.onboardingCredits !== undefined) updates.onboardingCredits = data.onboardingCredits
   if (data.features !== undefined) updates.features = data.features
-  if (data.razorpayPlanIds !== undefined) updates.razorpayPlanIds = data.razorpayPlanIds
+  if (data.cashfreePlanIds !== undefined) updates.cashfreePlanIds = data.cashfreePlanIds
   if (data.enabled !== undefined) updates.enabled = data.enabled
   if (data.sortOrder !== undefined) updates.sortOrder = data.sortOrder
 

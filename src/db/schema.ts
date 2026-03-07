@@ -112,8 +112,8 @@ export const billing = pgTable("billing", {
   monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // micro-units
   timeMonthlyReset: timestamp("time_monthly_reset").defaultNow(), // lazy reset at month boundary
   timeMonthlyUsageUpdated: timestamp("time_monthly_usage_updated"),
-  razorpayCustomerId: text("razorpay_customer_id"),
-  razorpaySubscriptionId: text("razorpay_subscription_id"),
+  cashfreeCustomerId: text("cashfree_customer_id"),
+  cashfreeSubscriptionId: text("cashfree_subscription_id"),
   reloadEnabled: boolean("reload_enabled").default(false),
   reloadAmount: integer("reload_amount").default(500),
   reloadTrigger: integer("reload_trigger").default(100),
@@ -142,7 +142,7 @@ export const subscriptions = pgTable(
       .notNull()
       .references(() => users.id),
     plan: text("plan", { enum: ["starter", "pro", "team"] }).notNull(),
-    razorpaySubscriptionId: text("razorpay_subscription_id"),
+    cashfreeSubscriptionId: text("cashfree_subscription_id"),
     rollingUsage: bigint("rolling_usage", { mode: "number" }).default(0),
     fixedUsage: bigint("fixed_usage", { mode: "number" }).default(0),
     timeRollingUpdated: timestamp("time_rolling_updated"),
@@ -296,7 +296,7 @@ export const plans = pgTable("plans", {
   monthlyLimit: bigint("monthly_limit", { mode: "number" }), // micro-units (USD-equivalent)
   onboardingCredits: bigint("onboarding_credits", { mode: "number" }).default(0),
   features: jsonb("features").default([]),
-  razorpayPlanIds: jsonb("razorpay_plan_ids").default({}), // {"USD": "plan_xxx", "INR": "plan_yyy"}
+  cashfreePlanIds: jsonb("cashfree_plan_ids").default({}), // {"USD": "plan_xxx", "INR": "plan_yyy"}
   enabled: boolean("enabled").notNull().default(true),
   sortOrder: integer("sort_order").default(0),
   timeCreated: timestamp("time_created").defaultNow().notNull(),
@@ -325,8 +325,8 @@ export const payments = pgTable(
     type: text("type", { enum: ["credits", "subscription", "onboarding", "refund"] }).notNull(),
     amountSmallest: integer("amount_smallest").notNull(), // cents/paise
     currency: text("currency").notNull().default("USD"),
-    razorpayOrderId: text("razorpay_order_id"),
-    razorpayPaymentId: text("razorpay_payment_id").unique(),
+    cashfreeOrderId: text("cashfree_order_id"),
+    cashfreePaymentId: text("cashfree_payment_id").unique(),
     status: text("status", { enum: ["created", "captured", "failed", "refunded"] })
       .notNull()
       .default("created"),
@@ -335,7 +335,7 @@ export const payments = pgTable(
   },
   (table) => [
     index("payments_workspace_idx").on(table.workspaceId),
-    index("payments_razorpay_order_idx").on(table.razorpayOrderId),
+    index("payments_cashfree_order_idx").on(table.cashfreeOrderId),
   ],
 )
 

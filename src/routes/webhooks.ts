@@ -2,7 +2,7 @@ import { Hono } from "hono"
 import { db } from "../db/client.ts"
 import { billing, subscriptions, webhookEvents, payments, plans } from "../db/schema.ts"
 import { eq, sql } from "drizzle-orm"
-import { verifyRazorpaySignature } from "../lib/razorpay.ts"
+import { verifyCashfreeWebhookSignature } from "../lib/cashfree.ts"
 import { createId } from "../lib/id.ts"
 
 export const webhookRoutes = new Hono()
@@ -21,58 +21,63 @@ async function claimEvent(eventId: string, eventType: string): Promise<boolean> 
   }
 }
 
-// ── Razorpay webhook handler ──
+// ── Cashfree webhook handler ──
 
-webhookRoutes.post("/razorpay", async (c) => {
+webhookRoutes.post("/cashfree", async (c) => {
   const body = await c.req.text()
-  const signature = c.req.header("x-razorpay-signature")
+  const signature = c.req.header("x-webhook-signature")
+  const timestamp = c.req.header("x-webhook-timestamp")
 
-  if (!signature || !(await verifyRazorpaySignature(body, signature))) {
+  if (!signature || !timestamp || !(await verifyCashfreeWebhookSignature(body, timestamp, signature))) {
     return c.json({ error: "Invalid signature" }, 400)
   }
 
-  const event = JSON.parse(body) as RazorpayWebhookEvent
+  const event = JSON.parse(body) as CashfreeWebhookEvent
 
-  // Idempotency: derive a unique event ID from the entity
+  // Idempotency: derive a unique event key
   const entityId =
-    event.payload.payment?.entity?.id ??
-    event.payload.subscription?.entity?.id ??
+    event.data?.subscription?.subscription_id ??
+    event.data?.order?.order_id ??
     "unknown"
-  const eventKey = `${event.event}:${entityId}`
+  const eventKey = `${event.type}:${entityId}`
 
-  if (!(await claimEvent(eventKey, event.event))) {
+  if (!(await claimEvent(eventKey, event.type))) {
     return c.json({ status: "ok", note: "duplicate" })
   }
 
-  switch (event.event) {
-    case "payment.captured": {
-      const payment = event.payload.payment.entity
-      const workspaceId = payment.notes?.workspaceId
-      const type = payment.notes?.type ?? "credits"
+  switch (event.type) {
+    case "PAYMENT_SUCCESS_WEBHOOK": {
+      // One-time payment (credits) completed
+      const order = event.data?.order
+      if (!order) break
+
+      const orderId = order.order_id
+      const tags = order.order_tags ?? {}
+      const workspaceId = tags.workspaceId
+      const type = tags.type ?? "credits"
 
       if (!workspaceId) break
 
-      // Record payment history (idempotent via unique razorpay_payment_id)
+      // Record payment history (idempotent via unique cashfree_payment_id)
       try {
         await db.insert(payments).values({
           id: createId("pay"),
           workspaceId,
-          userId: payment.notes?.userId ?? null,
+          userId: tags.userId ?? null,
           type: type as "credits" | "subscription",
-          amountSmallest: payment.amount, // already in smallest unit (paise/cents)
-          currency: payment.currency,
-          razorpayOrderId: payment.notes?.orderId ?? null,
-          razorpayPaymentId: payment.id,
+          amountSmallest: Math.round((order.order_amount ?? 0) * 100), // display → smallest
+          currency: order.order_currency ?? "INR",
+          cashfreeOrderId: orderId,
+          cashfreePaymentId: event.data?.payment?.cf_payment_id ?? `cf_${orderId}`,
           status: "captured",
-          metadata: { notes: payment.notes },
+          metadata: { tags },
         })
       } catch {
-        // Unique constraint on razorpay_payment_id = already recorded
+        // Unique constraint on cashfree_payment_id = already recorded
       }
 
       if (type === "credits") {
-        // Convert smallest units (cents/paise) to micro-units
-        const creditMicro = payment.amount * 10_000
+        const creditMicro = Math.round((order.order_amount ?? 0) * 100) * 10_000
         await db
           .update(billing)
           .set({
@@ -84,11 +89,15 @@ webhookRoutes.post("/razorpay", async (c) => {
       break
     }
 
-    case "subscription.activated": {
-      const sub = event.payload.subscription.entity
-      const workspaceId = sub.notes?.workspaceId
-      const userId = sub.notes?.userId
-      const plan = sub.notes?.plan as "starter" | "pro" | "team"
+    case "SUBSCRIPTION_NEW_ACTIVATION": {
+      // Subscription activated
+      const sub = event.data?.subscription
+      if (!sub) break
+
+      const tags = sub.subscription_tags ?? {}
+      const workspaceId = tags.workspaceId
+      const userId = tags.userId
+      const plan = tags.plan as "starter" | "pro" | "team"
 
       if (!workspaceId || !userId || !plan) break
 
@@ -97,13 +106,13 @@ webhookRoutes.post("/razorpay", async (c) => {
         workspaceId,
         userId,
         plan,
-        razorpaySubscriptionId: sub.id,
-      })
+        cashfreeSubscriptionId: sub.subscription_id,
+      }).onConflictDoNothing()
 
       await db
         .update(billing)
         .set({
-          razorpaySubscriptionId: sub.id,
+          cashfreeSubscriptionId: sub.subscription_id,
           timeUpdated: new Date(),
         })
         .where(eq(billing.workspaceId, workspaceId))
@@ -111,59 +120,83 @@ webhookRoutes.post("/razorpay", async (c) => {
       break
     }
 
-    case "subscription.updated": {
-      // Handles plan changes (e.g., downgrade taking effect at cycle end)
-      const updatedSub = event.payload.subscription.entity
-      const newRzPlanId = updatedSub.plan_id
+    case "SUBSCRIPTION_PAYMENT_SUCCESS": {
+      // Recurring subscription payment succeeded
+      const sub = event.data?.subscription
+      if (!sub) break
 
-      // Find our subscription by Razorpay ID
-      const existingSub = await db
-        .select()
-        .from(subscriptions)
-        .where(eq(subscriptions.razorpaySubscriptionId, updatedSub.id))
-        .then((r) => r[0])
-
-      if (existingSub && newRzPlanId) {
-        // Map Razorpay plan ID back to our plan ID
-        const allPlans = await db.select().from(plans)
-        const matchedPlan = allPlans.find((p) => {
-          const rzIds = p.razorpayPlanIds as Record<string, string> | null
-          return rzIds && Object.values(rzIds).includes(newRzPlanId)
-        })
-
-        if (matchedPlan) {
-          await db
-            .update(subscriptions)
-            .set({
-              plan: matchedPlan.id as "starter" | "pro" | "team",
-              pendingPlan: null,
-              pendingPlanEffectiveAt: null,
-            })
-            .where(eq(subscriptions.id, existingSub.id))
-        }
-      }
-      break
-    }
-
-    case "subscription.cancelled":
-    case "subscription.completed": {
-      const sub = event.payload.subscription.entity
-      const workspaceId = sub.notes?.workspaceId
+      const tags = sub.subscription_tags ?? {}
+      const workspaceId = tags.workspaceId
 
       if (!workspaceId) break
 
-      await db
-        .update(subscriptions)
-        .set({ timeDeleted: new Date() })
-        .where(eq(subscriptions.razorpaySubscriptionId, sub.id))
+      // If there's a pending plan change, apply it now (downgrade at cycle end)
+      const existingSub = await db
+        .select()
+        .from(subscriptions)
+        .where(eq(subscriptions.cashfreeSubscriptionId, sub.subscription_id))
+        .then((r) => r[0])
 
-      await db
-        .update(billing)
-        .set({
-          razorpaySubscriptionId: null,
-          timeUpdated: new Date(),
-        })
-        .where(eq(billing.workspaceId, workspaceId))
+      if (existingSub?.pendingPlan) {
+        await db
+          .update(subscriptions)
+          .set({
+            plan: existingSub.pendingPlan as "starter" | "pro" | "team",
+            pendingPlan: null,
+            pendingPlanEffectiveAt: null,
+          })
+          .where(eq(subscriptions.id, existingSub.id))
+      }
+
+      break
+    }
+
+    case "SUBSCRIPTION_STATUS_CHANGE": {
+      // Subscription status changed (activated, cancelled, completed, expired)
+      const sub = event.data?.subscription
+      if (!sub) break
+
+      const status = sub.subscription_status
+      const tags = sub.subscription_tags ?? {}
+      const workspaceId = tags.workspaceId
+
+      if (!workspaceId) break
+
+      if (status === "ACTIVE") {
+        // Treat as activation (same logic as SUBSCRIPTION_NEW_ACTIVATION)
+        const userId = tags.userId
+        const plan = tags.plan as "starter" | "pro" | "team"
+        if (userId && plan) {
+          await db.insert(subscriptions).values({
+            id: createId("sub"),
+            workspaceId,
+            userId,
+            plan,
+            cashfreeSubscriptionId: sub.subscription_id,
+          }).onConflictDoNothing()
+
+          await db
+            .update(billing)
+            .set({
+              cashfreeSubscriptionId: sub.subscription_id,
+              timeUpdated: new Date(),
+            })
+            .where(eq(billing.workspaceId, workspaceId))
+        }
+      } else if (status === "CANCELLED" || status === "COMPLETED" || status === "EXPIRED") {
+        await db
+          .update(subscriptions)
+          .set({ timeDeleted: new Date() })
+          .where(eq(subscriptions.cashfreeSubscriptionId, sub.subscription_id))
+
+        await db
+          .update(billing)
+          .set({
+            cashfreeSubscriptionId: null,
+            timeUpdated: new Date(),
+          })
+          .where(eq(billing.workspaceId, workspaceId))
+      }
 
       break
     }
@@ -174,25 +207,26 @@ webhookRoutes.post("/razorpay", async (c) => {
 
 // ── Types ──
 
-interface RazorpayWebhookEvent {
-  event: string
-  payload: {
-    payment: {
-      entity: {
-        id: string
-        amount: number
-        currency: string
-        status: string
-        notes: Record<string, string>
-      }
+interface CashfreeWebhookEvent {
+  type: string
+  data: {
+    order?: {
+      order_id: string
+      order_amount: number
+      order_currency: string
+      order_tags: Record<string, string>
     }
-    subscription: {
-      entity: {
-        id: string
-        plan_id: string
-        status: string
-        notes: Record<string, string>
-      }
+    payment?: {
+      cf_payment_id: string
+      payment_status: string
+      payment_amount: number
+    }
+    subscription?: {
+      subscription_id: string
+      cf_subscription_id: string
+      subscription_status: string
+      subscription_tags: Record<string, string>
+      plan_details?: { plan_id: string }
     }
   }
 }
