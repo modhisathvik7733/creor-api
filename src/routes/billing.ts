@@ -401,8 +401,8 @@ billingRoutes.post("/activate-subscription", requireAdmin, zValidator("json", ac
     return c.json({ error: "Could not verify subscription with Cashfree" }, 400)
   }
 
-  if (cfSub.subscription_status !== "ACTIVE" && cfSub.subscription_status !== "INITIALIZED") {
-    return c.json({ error: `Subscription status is "${cfSub.subscription_status}", not active` }, 400)
+  if (cfSub.subscription_status !== "ACTIVE") {
+    return c.json({ error: `Subscription status is "${cfSub.subscription_status}", payment not completed` }, 400)
   }
 
   // Read plan from subscription tags
