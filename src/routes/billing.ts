@@ -857,7 +857,12 @@ billingRoutes.post("/reset-subscription", requireAdmin, async (c) => {
     .set({ cashfreeSubscriptionId: null, timeUpdated: new Date() })
     .where(eq(billing.workspaceId, auth.workspaceId))
 
-  return c.json({ success: true, message: "Subscription reset. You can now subscribe again." })
+  // Delete all payment history for this workspace
+  await db
+    .delete(payments)
+    .where(eq(payments.workspaceId, auth.workspaceId))
+
+  return c.json({ success: true, message: "Subscription and payment history reset." })
 })
 
 // ── Payment history ──
