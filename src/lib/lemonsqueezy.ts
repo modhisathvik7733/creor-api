@@ -1,4 +1,4 @@
-import { createHmac } from "crypto"
+import { createHmac } from "node:crypto"
 
 const LS_BASE = "https://api.lemonsqueezy.com/v1"
 
