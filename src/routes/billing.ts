@@ -286,6 +286,24 @@ billingRoutes.get("/subscription", async (c) => {
 
   const prices = plan?.prices as Record<string, number> | null
 
+  // Fetch card + portal info from Lemon Squeezy
+  let cardBrand: string | null = null
+  let cardLastFour: string | null = null
+  let updatePaymentUrl: string | null = null
+  let renewsAt: string | null = null
+
+  if (sub.lsSubscriptionId) {
+    try {
+      const lsSub = await getLsSubscription(sub.lsSubscriptionId)
+      cardBrand = lsSub.data.attributes.card_brand ?? null
+      cardLastFour = lsSub.data.attributes.card_last_four ?? null
+      updatePaymentUrl = lsSub.data.attributes.urls?.update_payment_method ?? null
+      renewsAt = lsSub.data.attributes.renews_at ?? null
+    } catch {
+      // LS fetch failed — return what we have locally
+    }
+  }
+
   return c.json({
     active: true,
     plan: sub.plan,
@@ -295,6 +313,10 @@ billingRoutes.get("/subscription", async (c) => {
     graceUntil: sub.graceUntil?.toISOString() ?? null,
     pendingPlan: sub.pendingPlan ?? null,
     pendingPlanEffectiveAt: sub.pendingPlanEffectiveAt?.toISOString() ?? null,
+    cardBrand,
+    cardLastFour,
+    updatePaymentUrl,
+    renewsAt,
   })
 })
 
