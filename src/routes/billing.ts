@@ -5,7 +5,7 @@ import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, payments, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, desc, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
-import { createCashfreeOrder, getCashfreeOrderStatus, createCashfreePlan, createCashfreeSubscription, fetchCashfreeSubscription, manageCashfreeSubscription } from "../lib/cashfree.ts"
+import { createCashfreeOrder, getCashfreeOrderStatus, createCashfreeSubscription, fetchCashfreeSubscription, manageCashfreeSubscription, checkSubscriptionPaymentMethods } from "../lib/cashfree.ts"
 import { createId } from "../lib/id.ts"
 import {
   MICRO,
@@ -333,35 +333,10 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
   if (!plan) return c.json({ error: "Plan not found" }, 400)
 
-  // Get Cashfree plan ID for this currency (auto-create if missing)
-  const cashfreePlanIds = plan.cashfreePlanIds as Record<string, string> | null
-  let cashfreePlanId = cashfreePlanIds?.[currency]
-
-  if (!cashfreePlanId) {
-    const prices = plan.prices as Record<string, number> | null
-    const priceSmallest = prices?.[currency]
-    if (!priceSmallest) {
-      return c.json({ error: `Plan ${planId} not available in ${currency}` }, 400)
-    }
-    const priceDisplay = priceSmallest / 100 // smallest → display units
-    const cfPlanId = `creor_${planId}_${currency.toLowerCase()}`
-    try {
-      await createCashfreePlan({
-        planId: cfPlanId,
-        name: `Creor ${plan.name} (${currency})`,
-        amount: priceDisplay,
-        currency,
-        intervalType: "MONTH",
-        intervals: 1,
-      })
-      cashfreePlanId = cfPlanId
-      await db.update(plans).set({
-        cashfreePlanIds: { ...(cashfreePlanIds ?? {}), [currency]: cfPlanId },
-        timeUpdated: new Date(),
-      }).where(eq(plans.id, planId))
-    } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : "Failed to create payment plan" }, 500)
-    }
+  const prices = plan.prices as Record<string, number> | null
+  const priceSmallest = prices?.[currency]
+  if (!priceSmallest) {
+    return c.json({ error: `Plan ${planId} not available in ${currency}` }, 400)
   }
 
   try {
@@ -371,10 +346,10 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     const subscriptionId = `sub_${auth.workspaceId}_${Date.now()}`
     const subscription = await createCashfreeSubscription({
       subscriptionId,
-      planId: cashfreePlanId,
+      planName: `Creor ${plan.name} (${currency})`,
+      planAmount: price,
       customerEmail: auth.email,
       customerPhone: "9999999999", // placeholder — Cashfree requires phone
-      planAmount: price, // charge full plan price upfront
       returnUrl: "https://creor.ai/dashboard/billing?payment=success",
       currency,
       tags: {
@@ -653,35 +628,10 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
   const newPrice = (newPlan.prices as Record<string, number>)?.[currency] ?? 0
   const isUpgrade = newPrice > currentPrice
 
-  // ── Ensure Cashfree plan exists for the new plan ──
-  const cfPlanIds = newPlan.cashfreePlanIds as Record<string, string> | null
-  let cfPlanId = cfPlanIds?.[currency]
-
-  if (!cfPlanId) {
-    const prices = newPlan.prices as Record<string, number> | null
-    const priceSmallest = prices?.[currency]
-    if (!priceSmallest) {
-      return c.json({ error: `Plan ${newPlanId} not available in ${currency}` }, 400)
-    }
-    const priceDisplay = priceSmallest / 100
-    const newCfPlanId = `creor_${newPlanId}_${currency.toLowerCase()}`
-    try {
-      await createCashfreePlan({
-        planId: newCfPlanId,
-        name: `Creor ${newPlan.name} (${currency})`,
-        amount: priceDisplay,
-        currency,
-        intervalType: "MONTH",
-        intervals: 1,
-      })
-      cfPlanId = newCfPlanId
-      await db.update(plans).set({
-        cashfreePlanIds: { ...(cfPlanIds ?? {}), [currency]: newCfPlanId },
-        timeUpdated: new Date(),
-      }).where(eq(plans.id, newPlanId))
-    } catch (err) {
-      return c.json({ error: err instanceof Error ? err.message : "Failed to create payment plan" }, 500)
-    }
+  // Check new plan has pricing for this currency
+  const newPlanPrices = newPlan.prices as Record<string, number> | null
+  if (!newPlanPrices?.[currency]) {
+    return c.json({ error: `Plan ${newPlanId} not available in ${currency}` }, 400)
   }
 
   if (isUpgrade) {
@@ -718,10 +668,10 @@ billingRoutes.post("/change-plan", requireAdmin, zValidator("json", changePlanSc
       const subscriptionId = `sub_${auth.workspaceId}_${Date.now()}`
       const subscription = await createCashfreeSubscription({
         subscriptionId,
-        planId: cfPlanId,
+        planName: `Creor ${newPlan.name} (${currency})`,
+        planAmount: price,
         customerEmail: auth.email,
         customerPhone: "9999999999",
-        planAmount: price,
         returnUrl: "https://creor.ai/dashboard/billing?payment=success",
         currency,
         tags: {
@@ -863,6 +813,17 @@ billingRoutes.post("/reset-subscription", requireAdmin, async (c) => {
     .where(eq(payments.workspaceId, auth.workspaceId))
 
   return c.json({ success: true, message: "Subscription and payment history reset." })
+})
+
+// ── Dev: check eligible payment methods on Cashfree account ──
+
+billingRoutes.get("/debug/payment-methods", requireAdmin, async (c) => {
+  try {
+    const methods = await checkSubscriptionPaymentMethods()
+    return c.json({ methods })
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "Failed to check" }, 500)
+  }
 })
 
 // ── Payment history ──

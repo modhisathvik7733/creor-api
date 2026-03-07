@@ -124,25 +124,28 @@ export async function createCashfreePlan(params: {
  * 2. authorization_amount = full plan price (kept, not refunded) — this IS the first month's payment
  * 3. subscription_first_charge_time = 1 month later — recurring charges start after the prepaid month
  *
- * payment_methods explicitly set to ["card", "upi"] so checkout shows both options.
+ * Uses inline plan_details (not plan_id reference) for full control over checkout.
+ * payment_methods: ["card", "upi", "enach", "pnach"] — all options, Cashfree shows
+ * only those enabled on the account.
  */
 export async function createCashfreeSubscription(params: {
   subscriptionId: string
-  planId: string
+  planName: string
+  planAmount: number // recurring charge in display units (e.g. 499)
   customerEmail: string
   customerPhone: string
-  planAmount: number // full plan price in display units (e.g. 23.99)
   returnUrl?: string
   currency?: string
   tags?: Record<string, string>
 }) {
+  const currency = params.currency ?? "INR"
+
   // Charge the full plan price as the authorization amount (covers first month).
-  // Explicitly list payment methods so checkout shows card + UPI options.
-  // Valid values: "card" (standing instructions), "upi" (autopay), "enach", "pnach"
+  // List all payment methods — Cashfree will only display those enabled on the account.
   const authDetails = {
     authorization_amount: params.planAmount,
     authorization_amount_refund: false,
-    payment_methods: ["card", "upi"],
+    payment_methods: ["card", "upi", "enach", "pnach"],
   }
 
   // First recurring charge = 1 month from now (upfront auth covers the first month).
@@ -169,8 +172,16 @@ export async function createCashfreeSubscription(params: {
         customer_email: params.customerEmail,
         customer_phone: params.customerPhone,
       },
+      // Inline plan details — no plan_id reference needed
       plan_details: {
-        plan_id: params.planId,
+        plan_name: params.planName,
+        plan_type: "PERIODIC",
+        plan_currency: currency,
+        plan_amount: params.planAmount,
+        plan_max_amount: params.planAmount * 2, // headroom for mandate ceiling
+        plan_max_cycles: 120,
+        plan_intervals: 1,
+        plan_interval_type: "MONTH",
       },
       authorization_details: authDetails,
       subscription_first_charge_time: firstChargeTime,
@@ -219,6 +230,25 @@ export async function manageCashfreeSubscription(params: {
     subscription_id: string
     subscription_status: string
   }>(`/subscriptions/${params.subscriptionId}/manage`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+
+/** Check which subscription payment methods are enabled on this Cashfree account */
+export async function checkSubscriptionPaymentMethods(subscriptionId?: string) {
+  const body: Record<string, unknown> = {}
+  if (subscriptionId) {
+    body.queries = { subscription_id: subscriptionId }
+  }
+  body.filters = { payment_methods: ["card", "upi", "enach", "pnach"] }
+
+  return cfFetch<Array<{
+    eligibility: boolean
+    entity_type: string
+    entity_value: string
+    entity_details: unknown
+  }>>("/subscriptions/eligibility/payment_methods", {
     method: "POST",
     body: JSON.stringify(body),
   })
