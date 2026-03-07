@@ -526,3 +526,50 @@ billingRoutes.get("/payments", async (c) => {
     limit,
   })
 })
+
+// ── TEST RESET: Wipe billing state for fresh testing ──
+// WARNING: This deletes all billing data for the workspace. Test only!
+
+billingRoutes.post("/reset-test", requireAdmin, async (c) => {
+  const auth = c.get("auth")
+  const wid = auth.workspaceId
+
+  // Cancel LS subscription if exists
+  const sub = await db
+    .select()
+    .from(subscriptions)
+    .where(and(eq(subscriptions.workspaceId, wid), isNull(subscriptions.timeDeleted)))
+    .then((r) => r[0])
+
+  if (sub?.lsSubscriptionId) {
+    try {
+      await cancelSubscription(sub.lsSubscriptionId)
+    } catch {
+      // May already be cancelled or expired
+    }
+  }
+
+  // Delete subscription records
+  await db
+    .update(subscriptions)
+    .set({ timeDeleted: new Date() })
+    .where(and(eq(subscriptions.workspaceId, wid), isNull(subscriptions.timeDeleted)))
+
+  // Delete all payment history
+  await db.delete(payments).where(eq(payments.workspaceId, wid))
+
+  // Reset billing record to defaults
+  await db
+    .update(billing)
+    .set({
+      balance: 0,
+      monthlyUsage: 0,
+      monthlyLimit: null,
+      lsSubscriptionId: null,
+      lsCustomerId: null,
+      timeUpdated: new Date(),
+    })
+    .where(eq(billing.workspaceId, wid))
+
+  return c.json({ success: true, message: "Billing fully reset. You are now on the Free plan." })
+})
