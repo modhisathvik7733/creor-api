@@ -371,6 +371,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
       planId: cashfreePlanId,
       customerEmail: auth.email,
       customerPhone: "9999999999", // placeholder — Cashfree requires phone
+      returnUrl: "https://creor.ai/dashboard/billing?payment=success",
       tags: {
         workspaceId: auth.workspaceId,
         userId: auth.userId,
