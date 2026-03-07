@@ -100,7 +100,6 @@ export async function createCheckout(params: {
   email?: string
   custom?: Record<string, string> // metadata → flows to webhook meta.custom_data
   redirectUrl?: string
-  embed?: boolean
 }): Promise<{ url: string; id: string }> {
   const res = await lsFetch<LSCheckoutResponse>("/checkouts", {
     method: "POST",
@@ -110,7 +109,7 @@ export async function createCheckout(params: {
         attributes: {
           ...(params.customPrice !== undefined && { custom_price: params.customPrice }),
           checkout_options: {
-            embed: params.embed ?? true,
+            embed: false,
             dark: true,
             media: false,
             desc: false,

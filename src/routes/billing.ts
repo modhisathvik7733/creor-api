@@ -198,7 +198,6 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
       usdAmount: String(amount),
     },
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?payment=success`,
-    embed: true,
   })
 
   return c.json({
@@ -242,7 +241,6 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
       plan: planId,
     },
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?subscription=success`,
-    embed: true,
   })
 
   const prices = plan.prices as Record<string, number> | null
