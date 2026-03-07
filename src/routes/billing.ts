@@ -200,7 +200,7 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?payment=success`,
     productName: "Creor Credits",
     productDescription: "Top-up credits for AI model usage beyond your plan allowance. Credits never expire.",
-    mediaUrls: [`${process.env.WEB_URL ?? "https://creor.ai"}/checkout-banner.svg`],
+    mediaUrls: [`${process.env.WEB_URL ?? "https://creor.ai"}/checkout-banner.png`],
   })
 
   return c.json({
@@ -247,7 +247,7 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
     redirectUrl: `${process.env.WEB_URL ?? "https://creor.ai"}/dashboard/billing?subscription=success`,
     productName: `Creor ${planLabel}`,
     productDescription: `${planLabel} plan — access all AI models with priority support and higher usage limits.`,
-    mediaUrls: [`${process.env.WEB_URL ?? "https://creor.ai"}/checkout-banner.svg`],
+    mediaUrls: [`${process.env.WEB_URL ?? "https://creor.ai"}/checkout-banner.png`],
   })
 
   const prices = plan.prices as Record<string, number> | null
