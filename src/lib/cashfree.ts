@@ -123,8 +123,15 @@ export async function createCashfreeSubscription(params: {
   customerEmail: string
   customerPhone: string
   returnUrl?: string
+  currency?: string
   tags?: Record<string, string>
 }) {
+  // INR subscriptions use EMANDATE to enable UPI AutoPay + Cards
+  // USD/EUR only support card-based authorization
+  const authDetails = params.currency === "INR"
+    ? { authorization_type: "EMANDATE", authorization_amount: 1, authorization_amount_refund: false }
+    : { authorization_amount: 1, authorization_amount_refund: false }
+
   return cfFetch<{
     cf_subscription_id: string
     subscription_id: string
@@ -141,6 +148,7 @@ export async function createCashfreeSubscription(params: {
       plan_details: {
         plan_id: params.planId,
       },
+      authorization_details: authDetails,
       subscription_meta: {
         return_url: params.returnUrl ?? null,
       },
