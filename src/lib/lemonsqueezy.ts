@@ -102,6 +102,7 @@ export async function createCheckout(params: {
   redirectUrl?: string
   productName?: string
   productDescription?: string
+  mediaUrls?: string[]
 }): Promise<{ url: string; id: string }> {
   const res = await lsFetch<LSCheckoutResponse>("/checkouts", {
     method: "POST",
@@ -124,6 +125,7 @@ export async function createCheckout(params: {
           product_options: {
             name: params.productName ?? undefined,
             description: params.productDescription ?? undefined,
+            media: params.mediaUrls ?? undefined,
             redirect_url: params.redirectUrl ?? undefined,
           },
         },
