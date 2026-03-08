@@ -386,6 +386,24 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
   return c.json(result)
 })
 
+// Realtime config — returns Supabase connection details for engine realtime subscription
+marketplaceRoutes.get("/realtime-config", requireAuth, async (c) => {
+  const supabaseUrl = process.env.CREOR_SUPABASE_URL || "https://uwhckbpjrpgopduiyeaw.supabase.co"
+  const anonKey = process.env.CREOR_SUPABASE_ANON_KEY
+
+  if (!anonKey) {
+    return c.json({ error: "Realtime not configured" }, 503)
+  }
+
+  const auth = c.get("auth")
+  return c.json({
+    supabaseUrl,
+    anonKey,
+    workspaceId: auth.workspaceId,
+    table: "mcp_installations",
+  })
+})
+
 // ── Admin: Catalog management ──
 
 const catalogCreateSchema = z.object({
