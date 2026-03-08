@@ -1,0 +1,36 @@
+-- Seed MCP catalog with curated MCP servers
+-- Uses ON CONFLICT to be idempotent (safe to run multiple times)
+
+INSERT INTO "mcp_catalog" ("id", "slug", "name", "description", "category", "icon", "author", "source_url", "server_type", "config_template", "config_params", "tags", "featured", "verified", "enabled", "sort_order", "install_count")
+VALUES
+  ('mcp_github', 'github', 'GitHub', 'Access GitHub repositories, issues, pull requests, and code search.', 'developer', 'Github', 'Anthropic', 'https://github.com/modelcontextprotocol/servers/tree/main/src/github', 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-github"],"environment":{"GITHUB_PERSONAL_ACCESS_TOKEN":""}}', '[{"key":"GITHUB_PERSONAL_ACCESS_TOKEN","label":"GitHub Personal Access Token","placeholder":"ghp_xxxxxxxxxxxxxxxxxxxx","required":true,"secret":true}]', '["version-control","code-review","issues"]', true, true, true, 1, 0),
+
+  ('mcp_slack', 'slack', 'Slack', 'Read and send messages in Slack channels. Search conversations and interact with your team.', 'communication', 'MessageSquare', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-slack"],"environment":{"SLACK_BOT_TOKEN":"","SLACK_TEAM_ID":""}}', '[{"key":"SLACK_BOT_TOKEN","label":"Slack Bot Token","placeholder":"xoxb-...","required":true,"secret":true},{"key":"SLACK_TEAM_ID","label":"Slack Team ID","placeholder":"T0123456789","required":true,"secret":false}]', '["messaging","team-communication"]', true, true, true, 2, 0),
+
+  ('mcp_notion', 'notion', 'Notion', 'Search, read, and create pages in Notion. Manage databases and workspace content.', 'productivity', 'FileText', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@notionhq/notion-mcp-server"],"environment":{"OPENAPI_MCP_HEADERS":""}}', '[{"key":"NOTION_API_KEY","label":"Notion Integration Token","placeholder":"ntn_...","required":true,"secret":true}]', '["notes","wiki","project-management"]', true, true, true, 3, 0),
+
+  ('mcp_supabase', 'supabase', 'Supabase', 'Manage Supabase projects, run SQL queries, manage tables, and deploy edge functions.', 'database', 'Database', 'Supabase', NULL, 'remote', '{"type":"remote","url":"https://mcp.supabase.com"}', '[]', '["database","postgres","serverless"]', true, true, true, 4, 0),
+
+  ('mcp_memory', 'memory', 'Memory (Knowledge Graph)', 'Persistent memory using a local knowledge graph. Store facts and relationships across sessions.', 'ai', 'Brain', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-memory"]}', '[]', '["memory","knowledge-graph","persistence"]', true, true, true, 5, 0),
+
+  ('mcp_linear', 'linear', 'Linear', 'Create and manage Linear issues, projects, and cycles. Track engineering work.', 'productivity', 'CheckSquare', 'Community', NULL, 'local', '{"type":"local","command":["npx","-y","mcp-linear"],"environment":{"LINEAR_API_KEY":""}}', '[{"key":"LINEAR_API_KEY","label":"Linear API Key","placeholder":"lin_api_...","required":true,"secret":true}]', '["project-management","issue-tracking"]', false, true, true, 6, 0),
+
+  ('mcp_postgres', 'postgres', 'PostgreSQL', 'Connect to PostgreSQL databases. Run queries, inspect schemas, and manage tables.', 'database', 'Database', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-postgres"],"environment":{"POSTGRES_URL":""}}', '[{"key":"POSTGRES_URL","label":"PostgreSQL Connection URL","placeholder":"postgresql://user:pass@host:5432/db","required":true,"secret":true}]', '["database","sql"]', false, true, true, 7, 0),
+
+  ('mcp_filesystem', 'filesystem', 'Filesystem', 'Read, write, and manage files on the local filesystem.', 'developer', 'FolderOpen', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-filesystem","/path/to/dir"]}', '[{"key":"ALLOWED_DIR","label":"Allowed Directory Path","placeholder":"/Users/you/projects","required":true,"secret":false}]', '["files","local"]', false, true, true, 8, 0),
+
+  ('mcp_brave_search', 'brave-search', 'Brave Search', 'Search the web using Brave Search API. Get search results and web pages.', 'ai', 'Search', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-brave-search"],"environment":{"BRAVE_API_KEY":""}}', '[{"key":"BRAVE_API_KEY","label":"Brave Search API Key","placeholder":"BSA...","required":true,"secret":true}]', '["search","web"]', false, true, true, 9, 0),
+
+  ('mcp_google_drive', 'google-drive', 'Google Drive', 'Search and read files from Google Drive. Access documents and spreadsheets.', 'productivity', 'HardDrive', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-gdrive"],"environment":{"GDRIVE_CLIENT_ID":"","GDRIVE_CLIENT_SECRET":""}}', '[{"key":"GDRIVE_CLIENT_ID","label":"Google OAuth Client ID","placeholder":"xxxx.apps.googleusercontent.com","required":true,"secret":false},{"key":"GDRIVE_CLIENT_SECRET","label":"Google OAuth Client Secret","placeholder":"GOCSPX-...","required":true,"secret":true}]', '["files","cloud-storage"]', false, true, true, 10, 0),
+
+  ('mcp_sentry', 'sentry', 'Sentry', 'Access Sentry error tracking data. View issues, events, and project details.', 'developer', 'Bug', 'Sentry', NULL, 'local', '{"type":"local","command":["npx","-y","@sentry/mcp-server"],"environment":{"SENTRY_AUTH_TOKEN":""}}', '[{"key":"SENTRY_AUTH_TOKEN","label":"Sentry Auth Token","placeholder":"sntrys_...","required":true,"secret":true}]', '["error-tracking","monitoring"]', false, true, true, 11, 0),
+
+  ('mcp_puppeteer', 'puppeteer', 'Puppeteer', 'Control a headless browser for web scraping, testing, and automation.', 'developer', 'Globe', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-puppeteer"]}', '[]', '["browser","scraping","automation"]', false, true, true, 12, 0),
+
+  ('mcp_sqlite', 'sqlite', 'SQLite', 'Query and manage SQLite databases. Execute SQL and inspect schemas.', 'database', 'Database', 'Anthropic', NULL, 'local', '{"type":"local","command":["npx","-y","@modelcontextprotocol/server-sqlite"],"environment":{"SQLITE_DB_PATH":""}}', '[{"key":"SQLITE_DB_PATH","label":"SQLite Database Path","placeholder":"/path/to/database.db","required":true,"secret":false}]', '["database","sql","local"]', false, true, true, 13, 0),
+
+  ('mcp_exa', 'exa', 'Exa Search', 'AI-powered web search using Exa. Find relevant content and documentation.', 'ai', 'Sparkles', 'Exa', NULL, 'local', '{"type":"local","command":["npx","-y","exa-mcp-server"],"environment":{"EXA_API_KEY":""}}', '[{"key":"EXA_API_KEY","label":"Exa API Key","placeholder":"exa-...","required":true,"secret":true}]', '["search","ai-search","research"]', false, true, true, 14, 0),
+
+  ('mcp_todoist', 'todoist', 'Todoist', 'Manage tasks and projects in Todoist. Create, update, and complete tasks.', 'productivity', 'ListTodo', 'Community', NULL, 'local', '{"type":"local","command":["npx","-y","todoist-mcp-server"],"environment":{"TODOIST_API_TOKEN":""}}', '[{"key":"TODOIST_API_TOKEN","label":"Todoist API Token","placeholder":"your-api-token","required":true,"secret":true}]', '["tasks","todo","project-management"]', false, false, true, 15, 0)
+
+ON CONFLICT ("slug") DO NOTHING;
