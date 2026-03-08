@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from "crypto"
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from "node:crypto"
 
 /**
  * AES-256-GCM encryption/decryption for storing provider API keys.
