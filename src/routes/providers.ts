@@ -64,7 +64,7 @@ providerRoutes.put(
     }
 
     const { apiKey } = c.req.valid("json")
-    const encrypted = encrypt(apiKey)
+    const encrypted = await encrypt(apiKey)
 
     await db
       .insert(providerCredentials)
@@ -136,7 +136,7 @@ providerRoutes.post("/credentials/:provider/test", async (c) => {
 
   let apiKey: string
   try {
-    apiKey = decrypt(cred.credentials)
+    apiKey = await decrypt(cred.credentials)
   } catch {
     return c.json({ valid: false, error: "Failed to decrypt stored credential" })
   }

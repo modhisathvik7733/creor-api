@@ -134,97 +134,102 @@ marketplaceRoutes.post("/installations", zValidator("json", installSchema), asyn
   const auth = c.get("auth")
   const body = c.req.valid("json")
 
-  // Find catalog item
-  const [catalogItem] = await db
-    .select()
-    .from(mcpCatalog)
-    .where(and(eq(mcpCatalog.slug, body.catalogSlug), eq(mcpCatalog.enabled, true)))
+  try {
+    // Find catalog item
+    const [catalogItem] = await db
+      .select()
+      .from(mcpCatalog)
+      .where(and(eq(mcpCatalog.slug, body.catalogSlug), eq(mcpCatalog.enabled, true)))
 
-  if (!catalogItem) return c.json({ error: "Catalog item not found" }, 404)
+    if (!catalogItem) return c.json({ error: "Catalog item not found" }, 404)
 
-  // Validate required config params
-  const params = (catalogItem.configParams as Array<{ key: string; required: boolean }>) ?? []
-  for (const param of params) {
-    if (param.required && !body.configValues?.[param.key]) {
-      return c.json({ error: `Missing required config: ${param.key}` }, 400)
-    }
-  }
-
-  const mcpName = body.mcpName ?? catalogItem.slug
-
-  // Check for existing installation with same name
-  const [existing] = await db
-    .select({ id: mcpInstallations.id })
-    .from(mcpInstallations)
-    .where(
-      and(
-        eq(mcpInstallations.workspaceId, auth.workspaceId),
-        eq(mcpInstallations.mcpName, mcpName),
-        isNull(mcpInstallations.timeDeleted),
-      ),
-    )
-
-  if (existing) {
-    return c.json({ error: `MCP server with name "${mcpName}" already installed` }, 409)
-  }
-
-  // Build resolved config from template + user values
-  const template = catalogItem.configTemplate as Record<string, unknown>
-  const resolvedConfig = { ...template }
-  if (body.configValues && template.environment) {
-    resolvedConfig.environment = {
-      ...(template.environment as Record<string, string>),
-      ...body.configValues,
-    }
-  }
-
-  // Encrypt secret values
-  let encryptedValues: string | null = null
-  if (body.configValues) {
-    const secretParams = params.filter((p: any) => p.secret)
-    const secrets: Record<string, string> = {}
-    for (const sp of secretParams) {
-      if (body.configValues[sp.key]) {
-        secrets[sp.key] = body.configValues[sp.key]
+    // Validate required config params
+    const params = (catalogItem.configParams as Array<{ key: string; required: boolean }>) ?? []
+    for (const param of params) {
+      if (param.required && !body.configValues?.[param.key]) {
+        return c.json({ error: `Missing required config: ${param.key}` }, 400)
       }
     }
-    if (Object.keys(secrets).length > 0) {
-      encryptedValues = encrypt(JSON.stringify(secrets))
+
+    const mcpName = body.mcpName ?? catalogItem.slug
+
+    // Check for existing installation with same name
+    const [existing] = await db
+      .select({ id: mcpInstallations.id })
+      .from(mcpInstallations)
+      .where(
+        and(
+          eq(mcpInstallations.workspaceId, auth.workspaceId),
+          eq(mcpInstallations.mcpName, mcpName),
+          isNull(mcpInstallations.timeDeleted),
+        ),
+      )
+
+    if (existing) {
+      return c.json({ error: `MCP server with name "${mcpName}" already installed` }, 409)
     }
+
+    // Build resolved config from template + user values
+    const template = catalogItem.configTemplate as Record<string, unknown>
+    const resolvedConfig = { ...template }
+    if (body.configValues && template.environment) {
+      resolvedConfig.environment = {
+        ...(template.environment as Record<string, string>),
+        ...body.configValues,
+      }
+    }
+
+    // Encrypt secret values
+    let encryptedValues: string | null = null
+    if (body.configValues) {
+      const secretParams = params.filter((p: any) => p.secret)
+      const secrets: Record<string, string> = {}
+      for (const sp of secretParams) {
+        if (body.configValues[sp.key]) {
+          secrets[sp.key] = body.configValues[sp.key]
+        }
+      }
+      if (Object.keys(secrets).length > 0) {
+        encryptedValues = await encrypt(JSON.stringify(secrets))
+      }
+    }
+
+    const id = createId("mcpi")
+
+    await db.insert(mcpInstallations).values({
+      id,
+      workspaceId: auth.workspaceId,
+      catalogId: catalogItem.id,
+      userId: auth.userId,
+      mcpName,
+      config: resolvedConfig,
+      configValues: encryptedValues,
+      enabled: true,
+    })
+
+    // Increment install count
+    await db
+      .update(mcpCatalog)
+      .set({ installCount: sql`COALESCE(${mcpCatalog.installCount}, 0) + 1` })
+      .where(eq(mcpCatalog.id, catalogItem.id))
+
+    void logAudit({
+      workspaceId: auth.workspaceId,
+      userId: auth.userId,
+      action: "marketplace.install",
+      resourceType: "mcp_installation",
+      resourceId: id,
+      metadata: { catalogSlug: body.catalogSlug, mcpName },
+    })
+
+    // Invalidate catalog cache
+    catalogCache = null
+
+    return c.json({ id, mcpName }, 201)
+  } catch (err) {
+    console.error("Marketplace install error:", err)
+    return c.json({ error: "Failed to install MCP server" }, 500)
   }
-
-  const id = createId("mcpi")
-
-  await db.insert(mcpInstallations).values({
-    id,
-    workspaceId: auth.workspaceId,
-    catalogId: catalogItem.id,
-    userId: auth.userId,
-    mcpName,
-    config: resolvedConfig,
-    configValues: encryptedValues,
-    enabled: true,
-  })
-
-  // Increment install count
-  await db
-    .update(mcpCatalog)
-    .set({ installCount: sql`COALESCE(${mcpCatalog.installCount}, 0) + 1` })
-    .where(eq(mcpCatalog.id, catalogItem.id))
-
-  void logAudit({
-    workspaceId: auth.workspaceId,
-    userId: auth.userId,
-    action: "marketplace.install",
-    resourceType: "mcp_installation",
-    resourceId: id,
-    metadata: { catalogSlug: body.catalogSlug, mcpName },
-  })
-
-  // Invalidate catalog cache
-  catalogCache = null
-
-  return c.json({ id, mcpName }, 201)
 })
 
 // Update installation (enable/disable, config)
@@ -262,7 +267,7 @@ marketplaceRoutes.patch(
 
     if (body.configValues) {
       // Re-encrypt values
-      updates.configValues = encrypt(JSON.stringify(body.configValues))
+      updates.configValues = await encrypt(JSON.stringify(body.configValues))
 
       // Update resolved config
       const config = installation.config as Record<string, unknown>
@@ -363,7 +368,7 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     // Decrypt and merge secret values into config
     if (row.configValues) {
       try {
-        const secrets = JSON.parse(decrypt(row.configValues)) as Record<string, string>
+        const secrets = JSON.parse(await decrypt(row.configValues)) as Record<string, string>
         if (config.environment) {
           config.environment = {
             ...(config.environment as Record<string, string>),

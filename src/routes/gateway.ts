@@ -346,7 +346,7 @@ async function getProviderConfig(model: string, workspaceId?: string): Promise<P
 
     if (cred) {
       try {
-        byokKey = decrypt(cred.credentials)
+        byokKey = await decrypt(cred.credentials)
       } catch (err) {
         console.error(`Failed to decrypt BYOK key for ${providerName}:`, err)
         // Fall through to env var
