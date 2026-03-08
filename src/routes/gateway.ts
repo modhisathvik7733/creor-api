@@ -1,9 +1,11 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { keys, billing, usage, subscriptions, plans } from "../db/schema.ts"
+import { keys, billing, usage, subscriptions, plans, providerCredentials } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
 import { MICRO, microToDisplay } from "../lib/currency.ts"
+import { checkQuota } from "../lib/quota.ts"
+import { decrypt } from "../lib/crypto.ts"
 
 export const gatewayRoutes = new Hono()
 
@@ -37,24 +39,35 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   }
 
   // Check billing
-  const bill = await db
+  let bill = await db
     .select()
     .from(billing)
     .where(eq(billing.workspaceId, keyData.workspaceId))
     .then((rows) => rows[0])
 
   if (!bill) {
-    return c.json({ error: { type: "BillingError", message: "No billing record found" } }, 402)
+    // Auto-create billing record for new workspaces (EC-5)
+    await db.insert(billing).values({
+      id: createId("bill"),
+      workspaceId: keyData.workspaceId,
+    }).onConflictDoNothing()
+    bill = await db
+      .select()
+      .from(billing)
+      .where(eq(billing.workspaceId, keyData.workspaceId))
+      .then((rows) => rows[0])
+    if (!bill) {
+      return c.json({ error: { type: "BillingError", message: "No billing record found" } }, 402)
+    }
   }
 
-  // Check subscription
+  // Check subscription (workspace-level, not user-level)
   const sub = await db
     .select()
     .from(subscriptions)
     .where(
       and(
         eq(subscriptions.workspaceId, keyData.workspaceId),
-        eq(subscriptions.userId, keyData.userId),
         isNull(subscriptions.timeDeleted),
       ),
     )
@@ -85,26 +98,57 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
   const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
 
-  // Block if over plan limit AND no credits for overage
-  if (effectiveLimit !== null && monthlyUsage >= effectiveLimit && bill.balance <= 0) {
-    const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-    return c.json(
-      {
-        error: {
-          type: "LimitError",
-          plan: userPlan?.id ?? "free",
-          message: hasSubscription
-            ? "Plan usage limit reached. Add credits or upgrade your plan."
-            : "Free tier limit reached. Subscribe or add credits to continue.",
-          monthlyUsage: microToDisplay(monthlyUsage),
-          monthlyLimit: microToDisplay(effectiveLimit),
-          balance: microToDisplay(bill.balance),
-          currency: bill.currency,
-          resetsAt: resetDate.toISOString(),
+  // Block logic: subscribers get overage allowance, free users hard-blocked
+  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
+  const hasCredits = bill.balance > 0
+
+  if (overPlanLimit && !hasCredits) {
+    if (hasSubscription) {
+      // Subscribers: allow overage up to 100% of plan limit before blocking
+      // e.g. Pro ($24 limit) can use up to $48 total before hard block
+      const overageUsed = monthlyUsage - effectiveLimit!
+      const maxOverage = effectiveLimit! // 100% of plan limit as cap
+      if (overageUsed < maxOverage) {
+        // Allow — usage tracked, balance goes negative (debt)
+        // User sees overage warning in IDE
+      } else {
+        // Subscriber hit overage cap — hard block
+        const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+        return c.json(
+          {
+            error: {
+              type: "LimitError",
+              plan: userPlan?.id ?? "free",
+              message: "Overage limit reached. Add credits to continue.",
+              monthlyUsage: microToDisplay(monthlyUsage),
+              monthlyLimit: microToDisplay(effectiveLimit!),
+              balance: microToDisplay(bill.balance),
+              currency: bill.currency,
+              resetsAt: resetDate.toISOString(),
+            },
+          },
+          402,
+        )
+      }
+    } else {
+      // Free users: hard block immediately
+      const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+      return c.json(
+        {
+          error: {
+            type: "LimitError",
+            plan: userPlan?.id ?? "free",
+            message: "Free tier limit reached. Subscribe or add credits to continue.",
+            monthlyUsage: microToDisplay(monthlyUsage),
+            monthlyLimit: microToDisplay(effectiveLimit!),
+            balance: microToDisplay(bill.balance),
+            currency: bill.currency,
+            resetsAt: resetDate.toISOString(),
+          },
         },
-      },
-      402,
-    )
+        402,
+      )
+    }
   }
 
   // Parse request
@@ -131,6 +175,28 @@ gatewayRoutes.post("/chat/completions", async (c) => {
         503,
       )
     }
+
+    // Enforce model tier restrictions (minPlan)
+    const minPlan = config.min_plan as string | undefined
+    if (minPlan && minPlan !== "free") {
+      const planOrder: Record<string, number> = { free: 0, starter: 1, pro: 2, team: 3 }
+      const requiredOrder = planOrder[minPlan] ?? 0
+      const currentOrder = planOrder[userPlan?.id ?? "free"] ?? 0
+      if (currentOrder < requiredOrder) {
+        return c.json(
+          {
+            error: {
+              type: "PlanError",
+              message: `Model ${model} requires ${minPlan} plan or higher.`,
+              requiredPlan: minPlan,
+              currentPlan: userPlan?.id ?? "free",
+            },
+          },
+          403,
+        )
+      }
+    }
+
     inputCost = Number(config.input_cost)
     outputCost = Number(config.output_cost)
   } else {
@@ -143,8 +209,8 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     console.warn(`Unknown model ${model} — using fallback pricing`)
   }
 
-  // Route to upstream provider
-  const providerConfig = getProviderConfig(model)
+  // Route to upstream provider (BYOK keys take priority over env vars)
+  const providerConfig = await getProviderConfig(model, keyData.workspaceId)
   if (!providerConfig) {
     return c.json({ error: { type: "ModelError", message: `Model ${model} not supported` } }, 400)
   }
@@ -223,6 +289,28 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   }
 })
 
+// ── Billing quota check (API key auth, for engine pre-flight) ──
+
+gatewayRoutes.get("/billing/quota", async (c) => {
+  const apiKey = c.req.header("Authorization")?.replace("Bearer ", "")
+  if (!apiKey) {
+    return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
+  }
+
+  const keyData = await db
+    .select({ workspaceId: keys.workspaceId })
+    .from(keys)
+    .where(and(eq(keys.key, apiKey), isNull(keys.timeDeleted)))
+    .then((rows) => rows[0])
+
+  if (!keyData) {
+    return c.json({ error: { type: "AuthError", message: "Invalid API key" } }, 401)
+  }
+
+  const result = await checkQuota(keyData.workspaceId)
+  return c.json(result)
+})
+
 // ── Provider routing ──
 
 interface ProviderConfig {
@@ -233,16 +321,49 @@ interface ProviderConfig {
   setAuth: (headers: Headers) => void
 }
 
-function getProviderConfig(model: string): ProviderConfig | null {
+async function getProviderConfig(model: string, workspaceId?: string): Promise<ProviderConfig | null> {
+  // Determine provider name from model prefix
+  let providerName: string | null = null
+  if (model.startsWith("anthropic/")) providerName = "anthropic"
+  else if (model.startsWith("openai/")) providerName = "openai"
+  else if (model.startsWith("google/")) providerName = "google"
+
+  if (!providerName) return null
+
+  // Check for workspace-level BYOK key (priority over env vars)
+  let byokKey: string | null = null
+  if (workspaceId) {
+    const cred = await db
+      .select({ credentials: providerCredentials.credentials })
+      .from(providerCredentials)
+      .where(
+        and(
+          eq(providerCredentials.workspaceId, workspaceId),
+          eq(providerCredentials.provider, providerName),
+        ),
+      )
+      .then((rows) => rows[0])
+
+    if (cred) {
+      try {
+        byokKey = decrypt(cred.credentials)
+      } catch (err) {
+        console.error(`Failed to decrypt BYOK key for ${providerName}:`, err)
+        // Fall through to env var
+      }
+    }
+  }
+
   if (model.startsWith("anthropic/")) {
     const upstreamModel = model.replace("anthropic/", "")
+    const apiKey = byokKey ?? process.env.ANTHROPIC_API_KEY!
     return {
       provider: "anthropic",
       baseUrl: "https://api.anthropic.com",
       path: "/v1/messages",
       upstreamModel,
       setAuth: (h) => {
-        h.set("x-api-key", process.env.ANTHROPIC_API_KEY!)
+        h.set("x-api-key", apiKey)
         h.set("anthropic-version", "2023-06-01")
       },
     }
@@ -250,23 +371,25 @@ function getProviderConfig(model: string): ProviderConfig | null {
 
   if (model.startsWith("openai/")) {
     const upstreamModel = model.replace("openai/", "")
+    const apiKey = byokKey ?? process.env.OPENAI_API_KEY!
     return {
       provider: "openai",
       baseUrl: "https://api.openai.com",
       path: "/v1/chat/completions",
       upstreamModel,
-      setAuth: (h) => h.set("Authorization", `Bearer ${process.env.OPENAI_API_KEY!}`),
+      setAuth: (h) => h.set("Authorization", `Bearer ${apiKey}`),
     }
   }
 
   if (model.startsWith("google/")) {
     const upstreamModel = model.replace("google/", "")
+    const apiKey = byokKey ?? process.env.GOOGLE_AI_API_KEY!
     return {
       provider: "google",
       baseUrl: "https://generativelanguage.googleapis.com",
-      path: `/v1beta/models/${upstreamModel}:generateContent`,
+      path: "/v1beta/openai/chat/completions",
       upstreamModel,
-      setAuth: (h) => h.set("x-goog-api-key", process.env.GOOGLE_AI_API_KEY!),
+      setAuth: (h) => h.set("Authorization", `Bearer ${apiKey}`),
     }
   }
 
@@ -298,7 +421,23 @@ async function trackUsageAsync(
     console.warn(`Estimated ${outputTokens} output tokens for ${ctx.model} (no usage data)`)
   }
 
-  if (inputTokens === 0 && outputTokens === 0) return
+  if (inputTokens === 0 && outputTokens === 0) {
+    // Still insert usage row for request count tracking (EC-4)
+    try {
+      await db.insert(usage).values({
+        id: createId("usg"),
+        workspaceId: ctx.keyData.workspaceId,
+        keyId: ctx.keyData.id,
+        model: ctx.model,
+        provider: ctx.provider,
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        costUsd: 0,
+      })
+    } catch { /* ignore */ }
+    return
+  }
 
   // Cost in USD micro-units
   const costUSD = (inputTokens * ctx.inputCost + outputTokens * ctx.outputCost) / 1_000
@@ -365,8 +504,10 @@ async function trackStreamUsage(
       }
     }
   } finally {
-    await writer.close()
-    // Track with usage data, or estimate from accumulated text
-    trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
+    try { await writer.close() } catch { /* client disconnected */ }
+    // Track if we have usage data or significant accumulated text (EC-3)
+    if (lastUsage || (accumulatedText && accumulatedText.length > 10)) {
+      trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
+    }
   }
 }

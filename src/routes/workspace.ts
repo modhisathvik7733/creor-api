@@ -5,6 +5,7 @@ import { db } from "../db/client.ts"
 import { workspaces, users, billing } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
+import { logAudit } from "../lib/audit.ts"
 
 export const workspaceRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -39,6 +40,15 @@ workspaceRoutes.patch("/current", requireAdmin, zValidator("json", updateSchema)
     .update(workspaces)
     .set({ ...body, timeUpdated: new Date() })
     .where(eq(workspaces.id, auth.workspaceId))
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "settings.updated",
+    resourceType: "workspace",
+    resourceId: auth.workspaceId,
+    metadata: body,
+  })
 
   return c.json({ success: true })
 })

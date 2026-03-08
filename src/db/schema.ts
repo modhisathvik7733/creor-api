@@ -348,6 +348,45 @@ export const paymentsRelations = relations(payments, ({ one }) => ({
 
 // ── Invites ──
 
+// ── Sessions (JWT revocation) ──
+
+export const sessions = pgTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    tokenHash: text("token_hash").notNull(),
+    device: text("device"),
+    ipAddress: text("ip_address"),
+    userAgent: text("user_agent"),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+    timeExpires: timestamp("time_expires").notNull(),
+    timeRevoked: timestamp("time_revoked"),
+  },
+  (table) => [
+    index("idx_sessions_user").on(table.userId),
+    index("idx_sessions_token_hash").on(table.tokenHash),
+  ],
+)
+
+export const sessionsRelations = relations(sessions, ({ one }) => ({
+  user: one(users, {
+    fields: [sessions.userId],
+    references: [users.id],
+  }),
+  workspace: one(workspaces, {
+    fields: [sessions.workspaceId],
+    references: [workspaces.id],
+  }),
+}))
+
+// ── Invites ──
+
 export const invites = pgTable(
   "invites",
   {
@@ -370,3 +409,138 @@ export const invites = pgTable(
     uniqueIndex("invites_workspace_email_idx").on(table.workspaceId, table.email),
   ],
 )
+
+// ── Audit Log ──
+
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    userId: text("user_id").references(() => users.id),
+    action: text("action").notNull(),
+    resourceType: text("resource_type"),
+    resourceId: text("resource_id"),
+    metadata: jsonb("metadata").default({}),
+    ipAddress: text("ip_address"),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+  },
+  (table) => [
+    index("idx_audit_log_workspace_time").on(table.workspaceId, table.timeCreated),
+  ],
+)
+
+export const auditLogRelations = relations(auditLog, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [auditLog.workspaceId],
+    references: [workspaces.id],
+  }),
+  user: one(users, {
+    fields: [auditLog.userId],
+    references: [users.id],
+  }),
+}))
+
+// ── Projects ──
+
+export const projects = pgTable(
+  "projects",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    name: text("name").notNull(),
+    path: text("path"),
+    repoUrl: text("repo_url"),
+    description: text("description"),
+    language: text("language"),
+    branch: text("branch").default("main"),
+    status: text("status").default("active"),
+    sessionCount: integer("session_count").default(0),
+    timeLastActive: timestamp("time_last_active"),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+    timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+    timeDeleted: timestamp("time_deleted"),
+  },
+  (table) => [
+    index("idx_projects_workspace").on(table.workspaceId),
+  ],
+)
+
+export const projectsRelations = relations(projects, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [projects.workspaceId],
+    references: [workspaces.id],
+  }),
+}))
+
+// ── MCP Catalog ──
+
+export const mcpCatalog = pgTable("mcp_catalog", {
+  id: text("id").primaryKey(),
+  slug: text("slug").notNull().unique(),
+  name: text("name").notNull(),
+  description: text("description").notNull(),
+  category: text("category").notNull(),
+  icon: text("icon"),
+  author: text("author"),
+  sourceUrl: text("source_url"),
+  docsUrl: text("docs_url"),
+  serverType: text("server_type").notNull(),
+  configTemplate: jsonb("config_template").notNull(),
+  configParams: jsonb("config_params").notNull().default([]),
+  tags: jsonb("tags").default([]),
+  featured: boolean("featured").default(false),
+  verified: boolean("verified").default(false),
+  enabled: boolean("enabled").notNull().default(true),
+  sortOrder: integer("sort_order").default(0),
+  installCount: integer("install_count").default(0),
+  timeCreated: timestamp("time_created").defaultNow().notNull(),
+  timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+})
+
+// ── MCP Installations ──
+
+export const mcpInstallations = pgTable(
+  "mcp_installations",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    catalogId: text("catalog_id")
+      .notNull()
+      .references(() => mcpCatalog.id),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    mcpName: text("mcp_name").notNull(),
+    config: jsonb("config").notNull(),
+    configValues: text("config_values"),
+    enabled: boolean("enabled").notNull().default(true),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+    timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+    timeDeleted: timestamp("time_deleted"),
+  },
+  (table) => [
+    index("idx_mcp_installations_workspace").on(table.workspaceId),
+  ],
+)
+
+export const mcpInstallationsRelations = relations(mcpInstallations, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [mcpInstallations.workspaceId],
+    references: [workspaces.id],
+  }),
+  catalog: one(mcpCatalog, {
+    fields: [mcpInstallations.catalogId],
+    references: [mcpCatalog.id],
+  }),
+  user: one(users, {
+    fields: [mcpInstallations.userId],
+    references: [users.id],
+  }),
+}))

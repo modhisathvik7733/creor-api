@@ -1,8 +1,8 @@
 import { createMiddleware } from "hono/factory"
 import { jwtVerify } from "jose"
 import { db } from "../db/client.ts"
-import { users } from "../db/schema.ts"
-import { eq, and, isNull } from "drizzle-orm"
+import { users, sessions } from "../db/schema.ts"
+import { eq, and, isNull, gt } from "drizzle-orm"
 
 export type AuthContext = {
   userId: string
@@ -11,8 +11,48 @@ export type AuthContext = {
   role: "owner" | "admin" | "member"
 }
 
+// ── In-memory LRU cache for session validation ──
+// Avoids a DB hit on every authenticated request.
+
+const SESSION_CACHE_MAX = 1000
+const SESSION_CACHE_TTL_MS = 60_000 // 60 seconds
+
+interface CacheEntry {
+  valid: boolean
+  expiresAt: number // Date.now() + TTL
+}
+
+const sessionCache = new Map<string, CacheEntry>()
+
+function sessionCacheGet(tokenHash: string): boolean | undefined {
+  const entry = sessionCache.get(tokenHash)
+  if (!entry) return undefined
+  if (Date.now() > entry.expiresAt) {
+    sessionCache.delete(tokenHash)
+    return undefined
+  }
+  return entry.valid
+}
+
+function sessionCacheSet(tokenHash: string, valid: boolean) {
+  // Evict oldest entries if at capacity
+  if (sessionCache.size >= SESSION_CACHE_MAX) {
+    const firstKey = sessionCache.keys().next().value
+    if (firstKey !== undefined) sessionCache.delete(firstKey)
+  }
+  sessionCache.set(tokenHash, { valid, expiresAt: Date.now() + SESSION_CACHE_TTL_MS })
+}
+
+async function hashToken(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token)
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data)
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
 /**
- * JWT auth middleware — verifies Supabase JWT or our own JWT tokens.
+ * JWT auth middleware — verifies our JWT tokens and checks session validity.
  * Sets `c.set("auth", { userId, workspaceId, ... })` on successful auth.
  */
 export const requireAuth = createMiddleware<{
@@ -32,6 +72,33 @@ export const requireAuth = createMiddleware<{
     const userId = payload.sub as string
     if (!userId) {
       return c.json({ error: "Invalid token: missing subject" }, 401)
+    }
+
+    // Check session validity (revocation check)
+    const tokenHash = await hashToken(token)
+    const cached = sessionCacheGet(tokenHash)
+    if (cached === false) {
+      return c.json({ error: "Session revoked" }, 401)
+    }
+    if (cached === undefined) {
+      // Cache miss — check DB
+      const activeSession = await db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(
+          and(
+            eq(sessions.tokenHash, tokenHash),
+            isNull(sessions.timeRevoked),
+            gt(sessions.timeExpires, new Date()),
+          ),
+        )
+        .then((rows) => rows[0])
+
+      const isValid = !!activeSession
+      sessionCacheSet(tokenHash, isValid)
+      if (!isValid) {
+        return c.json({ error: "Session revoked" }, 401)
+      }
     }
 
     // Look up user to get workspace and role

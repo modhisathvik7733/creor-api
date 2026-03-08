@@ -1,6 +1,7 @@
 import { Hono } from "hono"
 import { cors } from "hono/cors"
 import { logger } from "hono/logger"
+import { rateLimit } from "./middleware/rate-limit.ts"
 import { authRoutes } from "./routes/auth.ts"
 import { billingRoutes } from "./routes/billing.ts"
 import { workspaceRoutes } from "./routes/workspace.ts"
@@ -12,6 +13,12 @@ import { gatewayRoutes } from "./routes/gateway.ts"
 import { webhookRoutes } from "./routes/webhooks.ts"
 import { userRoutes } from "./routes/user.ts"
 import { adminRoutes } from "./routes/admin.ts"
+import { inviteRoutes } from "./routes/invites.ts"
+import { activityRoutes } from "./routes/activity.ts"
+import { catalogRoutes } from "./routes/catalog.ts"
+import { projectRoutes } from "./routes/projects.ts"
+import { providerRoutes } from "./routes/providers.ts"
+import { marketplaceRoutes } from "./routes/marketplace.ts"
 
 const app = new Hono()
 
@@ -35,6 +42,19 @@ app.use(
   }),
 )
 
+// Rate limiting
+app.use("*", rateLimit({ windowMs: 60_000, max: 300 }))
+app.use("/api/auth/*", rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  keyFn: (c: any) => c.req.header("x-forwarded-for") ?? c.req.header("cf-connecting-ip") ?? "unknown",
+}))
+app.use("/v1/*", rateLimit({
+  windowMs: 60_000,
+  max: 60,
+  keyFn: (c: any) => c.req.header("Authorization")?.replace("Bearer ", "") ?? "unknown",
+}))
+
 // Health check
 app.get("/health", (c) =>
   c.json({ status: "ok", version: "0.1.0", timestamp: new Date().toISOString() }),
@@ -51,6 +71,12 @@ app.route("/api/usage", usageRoutes)
 app.route("/api/share", shareRoutes)
 app.route("/api/webhooks", webhookRoutes)
 app.route("/api/admin", adminRoutes)
+app.route("/api/invites", inviteRoutes)
+app.route("/api/activity", activityRoutes)
+app.route("/api/projects", projectRoutes)
+app.route("/api/providers", providerRoutes)
+app.route("/api/catalog", catalogRoutes)
+app.route("/api/marketplace", marketplaceRoutes)
 
 // LLM Gateway (separate path for AI SDK compatibility)
 app.route("/v1", gatewayRoutes)

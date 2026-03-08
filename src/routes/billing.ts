@@ -8,6 +8,8 @@ import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.
 import { createCheckout, updateSubscription, cancelSubscription, getSubscription as getLsSubscription } from "../lib/lemonsqueezy.ts"
 import { createId } from "../lib/id.ts"
 import { MICRO, SYMBOL, CURRENCY, microToDisplay } from "../lib/currency.ts"
+import { checkQuota } from "../lib/quota.ts"
+import { logAudit } from "../lib/audit.ts"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -62,112 +64,8 @@ billingRoutes.get("/", async (c) => {
 
 billingRoutes.get("/quota", async (c) => {
   const auth = c.get("auth")
-  const bill = await db
-    .select()
-    .from(billing)
-    .where(eq(billing.workspaceId, auth.workspaceId))
-    .then((rows) => rows[0])
-
-  if (!bill) {
-    return c.json({ canSend: false, blockReason: "no_billing", warnings: [] }, 200)
-  }
-
-  // Subscription check
-  const sub = await db
-    .select()
-    .from(subscriptions)
-    .where(
-      and(
-        eq(subscriptions.workspaceId, auth.workspaceId),
-        isNull(subscriptions.timeDeleted),
-      ),
-    )
-    .then((rows) => rows[0])
-
-  const hasSubscription = !!sub
-
-  // Get effective plan (free tier for non-subscribers)
-  const userPlan = hasSubscription
-    ? await db.select().from(plans).where(eq(plans.id, sub!.plan)).then((r) => r[0])
-    : await db.select().from(plans).where(eq(plans.id, "free")).then((r) => r[0])
-
-  // Monthly usage (lazy-reset aware)
-  const now = new Date()
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
-  const monthlyUsage =
-    bill.timeMonthlyReset && bill.timeMonthlyReset < monthStart
-      ? 0
-      : (bill.monthlyUsage ?? 0)
-
-  // Plan limit in USD micro-units
-  const planLimitMicro = userPlan?.monthlyLimit ?? 500000 // fallback free tier $0.50
-  const workspaceLimitMicro = bill.monthlyLimit
-    ? bill.monthlyLimit * MICRO
-    : null
-  const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
-
-  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
-  const hasCredits = bill.balance > 0
-
-  // Determine if user can send
-  let canSend = true
-  let blockReason: string | null = null
-  const warnings: string[] = []
-
-  if (overPlanLimit && !hasCredits) {
-    canSend = false
-    blockReason = hasSubscription ? "limit_no_credits" : "free_limit_no_credits"
-  }
-
-  // Overage warning
-  if (overPlanLimit && hasCredits) {
-    warnings.push("using_credits")
-  }
-
-  // Monthly approaching
-  if (effectiveLimit !== null && monthlyUsage > 0 && !overPlanLimit) {
-    const pct = Math.round((monthlyUsage / effectiveLimit) * 100)
-    if (pct >= 80) warnings.push("monthly_approaching")
-  }
-
-  // Low credits warning
-  const lowThresholdRow = await db
-    .select()
-    .from(systemConfig)
-    .where(eq(systemConfig.key, "low_balance_threshold_usd"))
-    .then((r) => r[0])
-  const lowThresholdUsd = Number(lowThresholdRow?.value ?? 0.5)
-  const lowThresholdMicro = Math.round(lowThresholdUsd * MICRO)
-  if (bill.balance > 0 && bill.balance < lowThresholdMicro) {
-    warnings.push("low_credits")
-  }
-
-  const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
-
-  const prices = userPlan?.prices as Record<string, number> | null
-  const planPrice = prices?.["USD"] ? (prices["USD"] as number) / 100 : null
-
-  return c.json({
-    balance: microToDisplay(bill.balance),
-    currency: CURRENCY,
-    symbol: SYMBOL,
-    plan: userPlan
-      ? { id: userPlan.id, name: userPlan.name, price: planPrice }
-      : { id: "free", name: "Free", price: 0 },
-    monthly: {
-      current: microToDisplay(monthlyUsage),
-      max: effectiveLimit !== null ? microToDisplay(effectiveLimit) : null,
-      remaining: effectiveLimit !== null ? microToDisplay(Math.max(effectiveLimit - monthlyUsage, 0)) : null,
-      pct: effectiveLimit !== null && effectiveLimit > 0
-        ? Math.round((monthlyUsage / effectiveLimit) * 100)
-        : null,
-      resetsAt: resetDate.toISOString(),
-    },
-    canSend,
-    blockReason,
-    warnings,
-    overageActive: overPlanLimit && hasCredits,
-  })
+  const result = await checkQuota(auth.workspaceId)
+  return c.json(result)
 })
 
 // ── Add credits (Lemon Squeezy checkout with custom_price) ──
@@ -201,6 +99,14 @@ billingRoutes.post("/add-credits", requireAdmin, zValidator("json", addCreditsSc
     productName: "Creor Credits",
     productDescription: "Top-up credits for AI model usage beyond your plan allowance. Credits never expire.",
     mediaUrls: [`${process.env.WEB_URL ?? "https://creor.ai"}/checkout-banner.png`],
+  })
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "billing.checkout_started",
+    resourceType: "billing",
+    metadata: { amount, currency: CURRENCY },
   })
 
   return c.json({
@@ -252,6 +158,14 @@ billingRoutes.post("/subscribe", requireAdmin, zValidator("json", subscribeSchem
 
   const prices = plan.prices as Record<string, number> | null
   const priceUsd = prices?.["USD"] ? (prices["USD"] as number) / 100 : 0
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "billing.subscribe_started",
+    resourceType: "billing",
+    metadata: { plan: planId, price: priceUsd, currency: CURRENCY },
+  })
 
   return c.json({
     checkoutUrl: checkout.url,

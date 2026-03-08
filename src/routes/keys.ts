@@ -6,6 +6,7 @@ import { keys } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
 import { requireAuth, type AuthContext } from "../middleware/auth.ts"
 import { createId } from "../lib/id.ts"
+import { logAudit } from "../lib/audit.ts"
 
 export const keyRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -56,6 +57,15 @@ keyRoutes.post("/", zValidator("json", createKeySchema), async (c) => {
     key,
   })
 
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "key.created",
+    resourceType: "key",
+    resourceId: id,
+    metadata: { name },
+  })
+
   // Return full key only on creation
   return c.json({ id, name, key }, 201)
 })
@@ -70,6 +80,14 @@ keyRoutes.delete("/:id", async (c) => {
     .update(keys)
     .set({ timeDeleted: new Date() })
     .where(and(eq(keys.id, keyId), eq(keys.workspaceId, auth.workspaceId)))
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "key.deleted",
+    resourceType: "key",
+    resourceId: keyId,
+  })
 
   return c.json({ success: true })
 })

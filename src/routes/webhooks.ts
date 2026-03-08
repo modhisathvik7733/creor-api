@@ -223,7 +223,7 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
         break
       }
 
-      const sub = await db
+      let sub = await db
         .select()
         .from(subscriptions)
         .where(and(
@@ -232,11 +232,25 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
         ))
         .then((r) => r[0])
 
+      // EC-7: Retry if subscription_created hasn't been processed yet
+      if (!sub) {
+        await new Promise(r => setTimeout(r, 2000))
+        sub = await db
+          .select()
+          .from(subscriptions)
+          .where(and(
+            eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
+            isNull(subscriptions.timeDeleted),
+          ))
+          .then((r) => r[0])
+      }
+
       if (sub) {
         // Use actual amount from LS webhook data when available, fall back to plan price
+        // EC-8: LS sends subtotal_usd/total_usd in cents (e.g., 2399 = $23.99)
         let amountSmallest: number
         if (attrs.subtotal_usd !== undefined && attrs.subtotal_usd !== null) {
-          amountSmallest = Number(attrs.subtotal_usd) // LS sends cents
+          amountSmallest = Number(attrs.subtotal_usd)
         } else if (attrs.total_usd !== undefined && attrs.total_usd !== null) {
           amountSmallest = Number(attrs.total_usd)
         } else if (attrs.subtotal !== undefined && attrs.subtotal !== null) {

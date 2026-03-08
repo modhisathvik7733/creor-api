@@ -3,8 +3,8 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { SignJWT } from "jose"
 import { db } from "../db/client.ts"
-import { users, workspaces, billing, deviceCodes } from "../db/schema.ts"
-import { eq, and } from "drizzle-orm"
+import { users, workspaces, billing, deviceCodes, sessions, invites } from "../db/schema.ts"
+import { eq, and, isNull, gt } from "drizzle-orm"
 import { createId } from "../lib/id.ts"
 import { requireAuth } from "../middleware/auth.ts"
 
@@ -91,35 +91,71 @@ authRoutes.post("/github/callback", zValidator("json", githubCallbackSchema), as
     userId = existingUser.id
     workspaceId = existingUser.workspaceId
   } else {
-    // Create workspace + user + billing
-    workspaceId = createId("ws")
     userId = createId("usr")
-    await db.insert(workspaces).values({
-      id: workspaceId,
-      name: githubUser.name ?? githubUser.login,
-      slug: await uniqueSlug(githubUser.login.toLowerCase()),
-    })
 
-    await db.insert(users).values({
-      id: userId,
-      workspaceId,
-      email,
-      name: githubUser.name ?? githubUser.login,
-      role: "owner",
-      authProvider: "github",
-      authProviderId: String(githubUser.id),
-      avatarUrl: githubUser.avatar_url,
-    })
+    // Check for a pending invite matching this email
+    const pendingInvite = await db
+      .select()
+      .from(invites)
+      .where(
+        and(
+          eq(invites.email, email),
+          isNull(invites.timeAccepted),
+          isNull(invites.timeDeleted),
+        ),
+      )
+      .then((rows) => rows[0])
 
-    await db.insert(billing).values({
-      id: createId("bill"),
-      workspaceId,
-    })
+    if (pendingInvite) {
+      // Join the existing workspace from the invite
+      workspaceId = pendingInvite.workspaceId
 
+      await db.insert(users).values({
+        id: userId,
+        workspaceId,
+        email,
+        name: githubUser.name ?? githubUser.login,
+        role: pendingInvite.role,
+        authProvider: "github",
+        authProviderId: String(githubUser.id),
+        avatarUrl: githubUser.avatar_url,
+      })
+
+      // Mark invite as accepted
+      await db
+        .update(invites)
+        .set({ timeAccepted: new Date() })
+        .where(eq(invites.id, pendingInvite.id))
+    } else {
+      // No invite — create new workspace + user + billing
+      workspaceId = createId("ws")
+      await db.insert(workspaces).values({
+        id: workspaceId,
+        name: githubUser.name ?? githubUser.login,
+        slug: await uniqueSlug(githubUser.login.toLowerCase()),
+      })
+
+      await db.insert(users).values({
+        id: userId,
+        workspaceId,
+        email,
+        name: githubUser.name ?? githubUser.login,
+        role: "owner",
+        authProvider: "github",
+        authProviderId: String(githubUser.id),
+        avatarUrl: githubUser.avatar_url,
+      })
+
+      await db.insert(billing).values({
+        id: createId("bill"),
+        workspaceId,
+      })
+    }
   }
 
-  // Generate JWT
+  // Generate JWT + session
   const token = await createJWT(userId, workspaceId)
+  await createSession(token, userId, workspaceId, c.req.raw)
 
   return c.json({ token, userId, workspaceId })
 })
@@ -178,35 +214,72 @@ authRoutes.post("/google/callback", zValidator("json", googleCallbackSchema), as
     userId = existingUser.id
     workspaceId = existingUser.workspaceId
   } else {
-    workspaceId = createId("ws")
     userId = createId("usr")
-    const slug = await uniqueSlug(googleUser.email.split("@")[0].toLowerCase())
 
-    await db.insert(workspaces).values({
-      id: workspaceId,
-      name: googleUser.name,
-      slug,
-    })
+    // Check for a pending invite matching this email
+    const pendingInvite = await db
+      .select()
+      .from(invites)
+      .where(
+        and(
+          eq(invites.email, googleUser.email),
+          isNull(invites.timeAccepted),
+          isNull(invites.timeDeleted),
+        ),
+      )
+      .then((rows) => rows[0])
 
-    await db.insert(users).values({
-      id: userId,
-      workspaceId,
-      email: googleUser.email,
-      name: googleUser.name,
-      role: "owner",
-      authProvider: "google",
-      authProviderId: googleUser.id,
-      avatarUrl: googleUser.picture,
-    })
+    if (pendingInvite) {
+      // Join the existing workspace from the invite
+      workspaceId = pendingInvite.workspaceId
 
-    await db.insert(billing).values({
-      id: createId("bill"),
-      workspaceId,
-    })
+      await db.insert(users).values({
+        id: userId,
+        workspaceId,
+        email: googleUser.email,
+        name: googleUser.name,
+        role: pendingInvite.role,
+        authProvider: "google",
+        authProviderId: googleUser.id,
+        avatarUrl: googleUser.picture,
+      })
 
+      // Mark invite as accepted
+      await db
+        .update(invites)
+        .set({ timeAccepted: new Date() })
+        .where(eq(invites.id, pendingInvite.id))
+    } else {
+      // No invite — create new workspace + user + billing
+      workspaceId = createId("ws")
+      const slug = await uniqueSlug(googleUser.email.split("@")[0].toLowerCase())
+
+      await db.insert(workspaces).values({
+        id: workspaceId,
+        name: googleUser.name,
+        slug,
+      })
+
+      await db.insert(users).values({
+        id: userId,
+        workspaceId,
+        email: googleUser.email,
+        name: googleUser.name,
+        role: "owner",
+        authProvider: "google",
+        authProviderId: googleUser.id,
+        avatarUrl: googleUser.picture,
+      })
+
+      await db.insert(billing).values({
+        id: createId("bill"),
+        workspaceId,
+      })
+    }
   }
 
   const token = await createJWT(userId, workspaceId)
+  await createSession(token, userId, workspaceId, c.req.raw)
   return c.json({ token, userId, workspaceId })
 })
 
@@ -222,7 +295,10 @@ authRoutes.post("/refresh", async (c) => {
     const { jwtVerify } = await import("jose")
     const secret = new TextEncoder().encode(process.env.JWT_SECRET!)
     const { payload } = await jwtVerify(header.slice(7), secret)
-    const token = await createJWT(payload.sub as string, payload.workspaceId as string)
+    const userId = payload.sub as string
+    const workspaceId = payload.workspaceId as string
+    const token = await createJWT(userId, workspaceId)
+    await createSession(token, userId, workspaceId, c.req.raw)
     return c.json({ token })
   } catch {
     return c.json({ error: "Invalid token" }, 401)
@@ -326,6 +402,7 @@ authRoutes.post("/device/approve", requireAuth, zValidator("json", approveSchema
 
   // Generate a JWT for the IDE
   const token = await createJWT(auth.userId, auth.workspaceId)
+  await createSession(token, auth.userId, auth.workspaceId, c.req.raw)
 
   await db
     .update(deviceCodes)
@@ -340,7 +417,117 @@ authRoutes.post("/device/approve", requireAuth, zValidator("json", approveSchema
   return c.json({ success: true })
 })
 
+// ── Logout ──
+
+authRoutes.post("/logout", requireAuth, async (c) => {
+  const auth = c.get("auth")
+  const header = c.req.header("Authorization")
+  if (!header?.startsWith("Bearer ")) {
+    return c.json({ error: "Missing token" }, 401)
+  }
+
+  const tokenHash = await hashToken(header.slice(7))
+  await db
+    .update(sessions)
+    .set({ timeRevoked: new Date() })
+    .where(and(eq(sessions.tokenHash, tokenHash), eq(sessions.userId, auth.userId)))
+
+  return c.json({ success: true })
+})
+
+// ── List active sessions ──
+
+authRoutes.get("/sessions", requireAuth, async (c) => {
+  const auth = c.get("auth")
+
+  const activeSessions = await db
+    .select({
+      id: sessions.id,
+      device: sessions.device,
+      ipAddress: sessions.ipAddress,
+      userAgent: sessions.userAgent,
+      timeCreated: sessions.timeCreated,
+      timeExpires: sessions.timeExpires,
+    })
+    .from(sessions)
+    .where(
+      and(
+        eq(sessions.userId, auth.userId),
+        isNull(sessions.timeRevoked),
+        gt(sessions.timeExpires, new Date()),
+      ),
+    )
+
+  return c.json(activeSessions)
+})
+
+// ── Revoke a specific session ──
+
+authRoutes.delete("/sessions/:id", requireAuth, async (c) => {
+  const auth = c.get("auth")
+  const { id } = c.req.param()
+
+  const session = await db
+    .select({ id: sessions.id, userId: sessions.userId })
+    .from(sessions)
+    .where(eq(sessions.id, id))
+    .then((rows) => rows[0])
+
+  if (!session || session.userId !== auth.userId) {
+    return c.json({ error: "Session not found" }, 404)
+  }
+
+  await db
+    .update(sessions)
+    .set({ timeRevoked: new Date() })
+    .where(eq(sessions.id, id))
+
+  return c.json({ success: true })
+})
+
 // ── Helpers ──
+
+async function hashToken(token: string): Promise<string> {
+  const data = new TextEncoder().encode(token)
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data)
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+async function createSession(
+  token: string,
+  userId: string,
+  workspaceId: string,
+  request: Request,
+): Promise<void> {
+  const tokenHash = await hashToken(token)
+  const ua = request.headers.get("user-agent") ?? undefined
+  const ip =
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    request.headers.get("cf-connecting-ip") ??
+    undefined
+
+  // Parse a simple device label from the user-agent
+  let device: string | undefined
+  if (ua) {
+    if (ua.includes("Electron")) device = "Desktop App"
+    else if (ua.includes("Mobile")) device = "Mobile"
+    else if (ua.includes("Mozilla") || ua.includes("Chrome") || ua.includes("Safari")) device = "Browser"
+    else device = "Unknown"
+  }
+
+  await db.insert(sessions).values({
+    id: createId("sess"),
+    userId,
+    workspaceId,
+    tokenHash,
+    device,
+    ipAddress: ip,
+    userAgent: ua,
+    timeExpires: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days, matching JWT expiry
+  })
+}
 
 async function uniqueSlug(base: string): Promise<string> {
   let slug = base.replace(/[^a-z0-9-]/g, "").slice(0, 48)
