@@ -1,7 +1,7 @@
 import { createMiddleware } from "hono/factory"
 import { jwtVerify } from "jose"
 import { db } from "../db/client.ts"
-import { users, sessions } from "../db/schema.ts"
+import { users, sessions, keys } from "../db/schema.ts"
 import { eq, and, isNull, gt } from "drizzle-orm"
 
 export type AuthContext = {
@@ -64,6 +64,52 @@ export const requireAuth = createMiddleware<{
   }
 
   const token = header.slice(7)
+
+  // ── API Key auth (crk_ prefix) ──
+  if (token.startsWith("crk_")) {
+    const apiKey = await db
+      .select({
+        id: keys.id,
+        userId: keys.userId,
+        workspaceId: keys.workspaceId,
+      })
+      .from(keys)
+      .where(and(eq(keys.key, token), isNull(keys.timeDeleted)))
+      .then((rows) => rows[0])
+
+    if (!apiKey) {
+      return c.json({ error: "Invalid API key" }, 401)
+    }
+
+    const user = await db
+      .select({
+        id: users.id,
+        workspaceId: users.workspaceId,
+        email: users.email,
+        role: users.role,
+      })
+      .from(users)
+      .where(and(eq(users.id, apiKey.userId), isNull(users.timeDeleted)))
+      .then((rows) => rows[0])
+
+    if (!user) {
+      return c.json({ error: "User not found" }, 401)
+    }
+
+    // Update last-used timestamp (fire-and-forget)
+    db.update(keys).set({ timeUsed: new Date() }).where(eq(keys.id, apiKey.id)).catch(() => {})
+
+    c.set("auth", {
+      userId: user.id,
+      workspaceId: user.workspaceId,
+      email: user.email,
+      role: user.role as AuthContext["role"],
+    })
+    await next()
+    return
+  }
+
+  // ── JWT auth ──
   let verified = false
   try {
     const secret = new TextEncoder().encode(process.env.JWT_SECRET!)
