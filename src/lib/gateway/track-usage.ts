@@ -86,7 +86,8 @@ export async function trackUsageAsync(
 
 /**
  * Track usage from a streaming (SSE) response.
- * Pipes through the stream, accumulates usage data, then calls trackUsageAsync.
+ * Pipes through the stream, normalizes provider-specific fields,
+ * accumulates usage data, then calls trackUsageAsync.
  */
 export async function trackStreamUsage(
   upstream: ReadableStream<Uint8Array>,
@@ -96,77 +97,84 @@ export async function trackStreamUsage(
   const reader = upstream.getReader()
   const writer = writable.getWriter()
   const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
 
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
   let accumulatedText = ""
-
-  const encoder = new TextEncoder()
 
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
 
-      // Parse SSE chunks, extract usage, and strip provider-specific fields
       const text = decoder.decode(value, { stream: true })
       const lines = text.split("\n")
-      let cleaned = false
+      let needsRewrite = false
       const outputLines: string[] = []
 
       for (const line of lines) {
-        if (line.startsWith("data: ") && line !== "data: [DONE]") {
-          try {
-            const chunk = JSON.parse(line.slice(6))
-            if (chunk.usage) lastUsage = chunk.usage
-            // Accumulate text for Google token estimation
-            const delta =
-              chunk.choices?.[0]?.delta?.content ??
-              chunk.candidates?.[0]?.content?.parts?.[0]?.text
-            if (delta) accumulatedText += delta
+        // Pass through non-data lines and [DONE] marker unchanged
+        if (!line.startsWith("data: ") || line === "data: [DONE]") {
+          outputLines.push(line)
+          continue
+        }
 
-            // Normalize provider-specific fields that break AI SDK parsing
-            if (chunk.choices) {
-              for (const choice of chunk.choices) {
-                const toolCalls = choice.delta?.tool_calls
-                if (toolCalls) {
-                  for (let i = 0; i < toolCalls.length; i++) {
-                    const tc = toolCalls[i]
-                    // Inject missing index (Google omits it, AI SDK requires it)
-                    if (tc.index === undefined) {
-                      tc.index = i
-                      cleaned = true
-                    }
-                    // Strip extra_content (Google thought_signature)
-                    if (tc.extra_content) {
-                      delete tc.extra_content
-                      cleaned = true
-                    }
-                  }
+        let chunk: any
+        try {
+          chunk = JSON.parse(line.slice(6))
+        } catch {
+          outputLines.push(line)
+          continue
+        }
+
+        // Extract usage + text for tracking
+        if (chunk.usage) lastUsage = chunk.usage
+        const delta =
+          chunk.choices?.[0]?.delta?.content ??
+          chunk.candidates?.[0]?.content?.parts?.[0]?.text
+        if (delta) accumulatedText += delta
+
+        // Normalize Google-specific fields on tool_calls
+        let modified = false
+        if (chunk.choices) {
+          for (const choice of chunk.choices) {
+            const toolCalls = choice.delta?.tool_calls
+            if (toolCalls) {
+              for (let i = 0; i < toolCalls.length; i++) {
+                const tc = toolCalls[i]
+                // Inject missing index (Google omits it, AI SDK requires it)
+                if (tc.index === undefined) {
+                  tc.index = i
+                  modified = true
+                }
+                // Strip extra_content (Google thought_signature)
+                if (tc.extra_content) {
+                  delete tc.extra_content
+                  modified = true
                 }
               }
             }
-
-            // Re-serialize cleaned chunk
-            if (cleaned) {
-              outputLines.push("data: " + JSON.stringify(chunk))
-              continue
-            }
-          } catch {
-            // ignore parse errors, pass through as-is
           }
         }
-        outputLines.push(line)
+
+        if (modified) {
+          needsRewrite = true
+          outputLines.push("data: " + JSON.stringify(chunk))
+        } else {
+          outputLines.push(line)
+        }
       }
 
-      if (cleaned) {
+      if (needsRewrite) {
         await writer.write(encoder.encode(outputLines.join("\n")))
       } else {
         await writer.write(value)
       }
     }
+  } catch (err) {
+    console.error(`[gateway] stream pipe error for ${ctx.model}:`, err)
   } finally {
     try { await writer.close() } catch { /* client disconnected */ }
-    // Track if we have usage data or significant accumulated text
     if (lastUsage || (accumulatedText && accumulatedText.length > 10)) {
       trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
     }

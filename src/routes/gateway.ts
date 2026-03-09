@@ -126,6 +126,8 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   upstreamHeaders.set("Content-Type", "application/json")
   providerConfig.setAuth(upstreamHeaders)
 
+  console.log(`[gateway] ${model} stream=${isStream} workspace=${auth.workspaceId}`)
+
   try {
     const upstreamRes = await fetch(upstreamUrl, {
       method: "POST",
@@ -135,6 +137,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
     if (!upstreamRes.ok) {
       const errorBody = await upstreamRes.text()
+      console.error(`[gateway] upstream ${upstreamRes.status} for ${model}: ${errorBody.slice(0, 200)}`)
       return new Response(errorBody, {
         status: upstreamRes.status,
         headers: { "Content-Type": "application/json" },
@@ -171,16 +174,27 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       })
     }
 
-    // Non-streaming: read response, track usage
-    const responseClone = upstreamRes.clone()
-    const responseJson = (await responseClone.json()) as {
-      usage?: { prompt_tokens?: number; completion_tokens?: number }
+    // Non-streaming: normalize Google fields + track usage
+    const responseJson = await upstreamRes.json() as any
+
+    // Normalize Google-specific fields (same as streaming path)
+    if (responseJson.choices) {
+      for (const choice of responseJson.choices) {
+        const toolCalls = choice.message?.tool_calls
+        if (toolCalls) {
+          for (let i = 0; i < toolCalls.length; i++) {
+            if (toolCalls[i].index === undefined) toolCalls[i].index = i
+            if (toolCalls[i].extra_content) delete toolCalls[i].extra_content
+          }
+        }
+      }
     }
+
     trackUsageAsync(costCtx, responseJson.usage)
 
-    return new Response(upstreamRes.body, {
+    return c.json(responseJson, {
       status: upstreamRes.status,
-      headers: responseHeaders,
+      headers: Object.fromEntries(responseHeaders.entries()),
     })
   } catch (err: any) {
     return c.json(
