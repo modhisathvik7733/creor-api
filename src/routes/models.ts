@@ -25,6 +25,7 @@ modelRoutes.get("/", async (c) => {
       maxOutput: m.maxOutput,
       capabilities: m.capabilities,
       minPlan: m.minPlan,
+      sortOrder: m.sortOrder,
     })),
   })
 })
