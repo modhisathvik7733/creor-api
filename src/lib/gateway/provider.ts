@@ -4,6 +4,42 @@ import { eq, and } from "drizzle-orm"
 import { decrypt } from "../crypto.ts"
 import type { ProviderConfig } from "./types.ts"
 
+// ── BYOK cache (workspace+provider → decrypted key, 5 min TTL) ──
+const byokCache = new Map<string, { key: string | null; expires: number }>()
+const BYOK_TTL = 300_000 // 5 minutes
+
+async function getByokKey(workspaceId: string, providerName: string): Promise<string | null> {
+  const cacheKey = `${workspaceId}:${providerName}`
+  const now = Date.now()
+  const cached = byokCache.get(cacheKey)
+  if (cached && now < cached.expires) {
+    return cached.key
+  }
+
+  const cred = await db
+    .select({ credentials: providerCredentials.credentials })
+    .from(providerCredentials)
+    .where(
+      and(
+        eq(providerCredentials.workspaceId, workspaceId),
+        eq(providerCredentials.provider, providerName),
+      ),
+    )
+    .then((rows) => rows[0])
+
+  let key: string | null = null
+  if (cred) {
+    try {
+      key = await decrypt(cred.credentials)
+    } catch (err) {
+      console.error(`Failed to decrypt BYOK key for ${providerName}:`, err)
+    }
+  }
+
+  byokCache.set(cacheKey, { key, expires: now + BYOK_TTL })
+  return key
+}
+
 /**
  * Resolve the upstream LLM provider for a given model.
  * Checks workspace BYOK keys first, falls back to environment API keys.
@@ -19,28 +55,7 @@ export async function resolveProvider(
 
   if (!providerName) return null
 
-  // Check for workspace-level BYOK key (priority over env vars)
-  let byokKey: string | null = null
-  if (workspaceId) {
-    const cred = await db
-      .select({ credentials: providerCredentials.credentials })
-      .from(providerCredentials)
-      .where(
-        and(
-          eq(providerCredentials.workspaceId, workspaceId),
-          eq(providerCredentials.provider, providerName),
-        ),
-      )
-      .then((rows) => rows[0])
-
-    if (cred) {
-      try {
-        byokKey = await decrypt(cred.credentials)
-      } catch (err) {
-        console.error(`Failed to decrypt BYOK key for ${providerName}:`, err)
-      }
-    }
-  }
+  const byokKey = workspaceId ? await getByokKey(workspaceId, providerName) : null
 
   if (model.startsWith("anthropic/")) {
     const upstreamModel = model.replace("anthropic/", "")

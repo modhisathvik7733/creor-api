@@ -1,6 +1,6 @@
 import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, systemConfig } from "../db/schema.ts"
-import { eq, and, isNull } from "drizzle-orm"
+import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "./id.ts"
 import { MICRO, CURRENCY, SYMBOL, microToDisplay } from "./currency.ts"
 
@@ -178,5 +178,122 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     _effectiveLimitMicro: effectiveLimit,
     _monthlyUsageMicro: monthlyUsage,
     _balanceMicro: bill.balance,
+  }
+}
+
+/**
+ * Fast-path quota check for the gateway hot path.
+ * Uses a single SQL query instead of 4 sequential ones.
+ * Returns only what the gateway needs (canSend, plan, costs).
+ */
+export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> {
+  const rows = await db.execute(sql`
+    SELECT
+      b.balance,
+      b.monthly_usage,
+      b.monthly_limit AS workspace_limit,
+      b.time_monthly_reset,
+      s.id AS sub_id,
+      s.plan AS sub_plan,
+      s.status AS sub_status,
+      p.id AS plan_id,
+      p.name AS plan_name,
+      p.prices AS plan_prices,
+      p.monthly_limit AS plan_monthly_limit
+    FROM billing b
+    LEFT JOIN subscriptions s
+      ON s.workspace_id = b.workspace_id AND s.time_deleted IS NULL
+    LEFT JOIN plans p
+      ON p.id = COALESCE(s.plan, 'free')
+    WHERE b.workspace_id = ${workspaceId}
+    LIMIT 1
+  `)
+
+  const row = rows[0]
+  if (!row) {
+    return {
+      balance: 0,
+      currency: CURRENCY,
+      symbol: SYMBOL,
+      plan: { id: "free", name: "Free", price: 0 },
+      monthly: { current: 0, max: null, remaining: null, pct: null, resetsAt: "" },
+      canSend: false,
+      blockReason: "no_billing",
+      warnings: [],
+      overageActive: false,
+      _effectiveLimitMicro: null,
+      _monthlyUsageMicro: 0,
+      _balanceMicro: 0,
+    }
+  }
+
+  const balance = Number(row.balance ?? 0)
+  const hasSubscription = !!row.sub_id
+  const now = new Date()
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1))
+  const resetTime = row.time_monthly_reset ? new Date(row.time_monthly_reset as string) : null
+  const monthlyUsage = resetTime && resetTime < monthStart ? 0 : Number(row.monthly_usage ?? 0)
+
+  const planLimitMicro = Number(row.plan_monthly_limit ?? 500000)
+  const workspaceLimitMicro = row.workspace_limit ? Number(row.workspace_limit) * MICRO : null
+  const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
+
+  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
+  const hasCredits = balance > 0
+
+  let canSend = true
+  let blockReason: string | null = null
+  const warnings: string[] = []
+
+  if (overPlanLimit && !hasCredits) {
+    if (hasSubscription) {
+      const overageUsed = monthlyUsage - effectiveLimit!
+      if (overageUsed >= effectiveLimit!) {
+        canSend = false
+        blockReason = "overage_limit"
+      } else {
+        warnings.push("using_overage")
+      }
+    } else {
+      canSend = false
+      blockReason = "free_limit_no_credits"
+    }
+  }
+
+  if (overPlanLimit && hasCredits) {
+    warnings.push("using_credits")
+  }
+
+  if (row.sub_status === "past_due") {
+    warnings.push("payment_failed")
+  }
+
+  const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+  const prices = row.plan_prices as Record<string, number> | null
+  const planPrice = prices?.["USD"] ? (prices["USD"] as number) / 100 : null
+
+  return {
+    balance: microToDisplay(balance),
+    currency: CURRENCY,
+    symbol: SYMBOL,
+    plan: row.plan_id
+      ? { id: row.plan_id as string, name: row.plan_name as string, price: planPrice }
+      : { id: "free", name: "Free", price: 0 },
+    monthly: {
+      current: microToDisplay(monthlyUsage),
+      max: effectiveLimit !== null ? microToDisplay(effectiveLimit) : null,
+      remaining: effectiveLimit !== null ? microToDisplay(Math.max(effectiveLimit - monthlyUsage, 0)) : null,
+      pct: effectiveLimit !== null && effectiveLimit > 0
+        ? Math.round((monthlyUsage / effectiveLimit) * 100)
+        : null,
+      resetsAt: resetDate.toISOString(),
+    },
+    canSend,
+    blockReason,
+    warnings,
+    overageActive: overPlanLimit && (hasCredits || hasSubscription),
+    _effectiveLimitMicro: effectiveLimit,
+    _monthlyUsageMicro: monthlyUsage,
+    _balanceMicro: balance,
   }
 }

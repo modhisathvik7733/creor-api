@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { microToDisplay } from "../lib/currency.ts"
-import { checkQuota } from "../lib/quota.ts"
+import { checkQuotaFast } from "../lib/quota.ts"
 import { authenticateApiKey } from "../lib/gateway/authenticate.ts"
 import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement.ts"
 import { resolveProvider } from "../lib/gateway/provider.ts"
@@ -15,23 +15,39 @@ export const gatewayRoutes = new Hono()
  * Compatible with OpenAI's API format so AI SDKs work out of the box.
  * Supports: /v1/chat/completions
  *
- * Pipeline: authenticate → checkQuota → checkEntitlement → resolveProvider → proxy → trackUsage
+ * Pipeline: authenticate+parse → parallel(quota, modelConfig, resolveProvider) → proxy → trackUsage
  */
 gatewayRoutes.post("/chat/completions", async (c) => {
-  // ── 1. Authenticate ──
+  // ── 1. Authenticate + parse body (concurrent) ──
   const apiKey = c.req.header("Authorization")?.replace("Bearer ", "")
   if (!apiKey) {
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 
-  const auth = await authenticateApiKey(apiKey)
+  const [auth, body] = await Promise.all([
+    authenticateApiKey(apiKey),
+    c.req.json(),
+  ])
+
   if (!auth) {
     return c.json({ error: { type: "AuthError", message: "Invalid API key" } }, 401)
   }
 
-  // ── 2. Check quota (single source of truth for billing logic) ──
-  const quota = await checkQuota(auth.workspaceId)
+  const model = body.model as string
+  const isStream = body.stream === true
 
+  if (!model) {
+    return c.json({ error: { type: "ModelError", message: "Model is required" } }, 400)
+  }
+
+  // ── 2. Parallel: quota + model config + provider resolution ──
+  const [quota, modelConfig, providerConfig] = await Promise.all([
+    checkQuotaFast(auth.workspaceId),
+    getModelConfig(model),
+    resolveProvider(model, auth.workspaceId),
+  ])
+
+  // ── 3. Check quota ──
   if (!quota.canSend) {
     const now = new Date()
     const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
@@ -58,20 +74,10 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     )
   }
 
-  // ── 3. Parse request ──
-  const body = await c.req.json()
-  const model = body.model as string
-  const isStream = body.stream === true
-
-  if (!model) {
-    return c.json({ error: { type: "ModelError", message: "Model is required" } }, 400)
-  }
-
   // ── 4. Check model entitlement ──
   let inputCost: number
   let outputCost: number
 
-  const modelConfig = await getModelConfig(model)
   if (modelConfig) {
     if (!modelConfig.enabled) {
       return c.json(
@@ -103,8 +109,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     console.warn(`Unknown model ${model} — using fallback pricing`)
   }
 
-  // ── 5. Resolve upstream provider ──
-  const providerConfig = await resolveProvider(model, auth.workspaceId)
+  // ── 5. Validate provider ──
   if (!providerConfig) {
     return c.json({ error: { type: "ModelError", message: `Model ${model} not supported` } }, 400)
   }
@@ -198,7 +203,7 @@ gatewayRoutes.get("/billing/quota", async (c) => {
     return c.json({ error: { type: "AuthError", message: "Invalid API key" } }, 401)
   }
 
-  const result = await checkQuota(auth.workspaceId)
+  const result = await checkQuotaFast(auth.workspaceId)
 
   // Strip internal fields from API response
   const { _effectiveLimitMicro, _monthlyUsageMicro, _balanceMicro, ...publicResult } = result

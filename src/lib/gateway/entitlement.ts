@@ -11,37 +11,66 @@ export interface ModelConfig {
   minPlan: string | null
 }
 
+// ── In-memory cache for model configs (materialized view, rarely changes) ──
+let modelConfigCache: Map<string, ModelConfig | null> | null = null
+let modelConfigCacheTime = 0
+const MODEL_CONFIG_TTL = 60_000 // 1 minute
+
+async function loadModelConfigs(): Promise<Map<string, ModelConfig | null>> {
+  const now = Date.now()
+  if (modelConfigCache && now - modelConfigCacheTime < MODEL_CONFIG_TTL) {
+    return modelConfigCache
+  }
+
+  const rows = await db.execute(sql`SELECT * FROM gateway_config`)
+  const cache = new Map<string, ModelConfig | null>()
+
+  for (const row of rows) {
+    cache.set(row.model_id as string, {
+      enabled: row.enabled as boolean,
+      inputCost: Number(row.input_cost),
+      outputCost: Number(row.output_cost),
+      minPlan: (row.min_plan as string) ?? null,
+    })
+  }
+
+  modelConfigCache = cache
+  modelConfigCacheTime = now
+  return cache
+}
+
 /**
  * Look up model config from the gateway_config materialized view.
- * Returns pricing and tier requirements for the model.
+ * Uses an in-memory cache (1 min TTL) to avoid per-request DB queries.
  */
 export async function getModelConfig(model: string): Promise<ModelConfig | null> {
-  const config = await db
-    .execute(sql`SELECT * FROM gateway_config WHERE model_id = ${model}`)
-    .then((r) => r[0])
-
-  if (!config) return null
-
-  return {
-    enabled: config.enabled as boolean,
-    inputCost: Number(config.input_cost),
-    outputCost: Number(config.output_cost),
-    minPlan: (config.min_plan as string) ?? null,
-  }
+  const cache = await loadModelConfigs()
+  return cache.get(model) ?? null
 }
+
+// ── Fallback pricing cache ──
+let fallbackPricingCache: { inputCost: number; outputCost: number } | null = null
+let fallbackPricingCacheTime = 0
 
 /**
  * Get fallback pricing for unknown models.
  */
 export async function getFallbackPricing(): Promise<{ inputCost: number; outputCost: number }> {
+  const now = Date.now()
+  if (fallbackPricingCache && now - fallbackPricingCacheTime < MODEL_CONFIG_TTL) {
+    return fallbackPricingCache
+  }
+
   const fallback = await db
     .execute(sql`SELECT fallback_input, fallback_output FROM gateway_config LIMIT 1`)
     .then((r) => r[0])
 
-  return {
+  fallbackPricingCache = {
     inputCost: Number(fallback?.fallback_input ?? 0.003),
     outputCost: Number(fallback?.fallback_output ?? 0.015),
   }
+  fallbackPricingCacheTime = now
+  return fallbackPricingCache
 }
 
 /**
