@@ -424,6 +424,7 @@ const catalogCreateSchema = z.object({
       placeholder: z.string(),
       required: z.boolean(),
       secret: z.boolean(),
+      helpUrl: z.string().optional(),
     }),
   ).optional(),
   tags: z.array(z.string()).optional(),
