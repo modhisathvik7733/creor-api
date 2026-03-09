@@ -138,6 +138,9 @@ export const subscriptions = pgTable(
       .notNull()
       .references(() => users.id),
     plan: text("plan", { enum: ["starter", "pro", "team"] }).notNull(),
+    status: text("status", { enum: ["active", "past_due", "cancelled", "expired"] })
+      .notNull()
+      .default("active"),
     lsSubscriptionId: text("ls_subscription_id"),
     rollingUsage: bigint("rolling_usage", { mode: "number" }).default(0),
     fixedUsage: bigint("fixed_usage", { mode: "number" }).default(0),
@@ -160,6 +163,7 @@ export const usage = pgTable(
   "usage",
   {
     id: text("id").primaryKey(),
+    requestId: text("request_id").unique(), // idempotency key — prevents double-counting on retries
     workspaceId: text("workspace_id")
       .notNull()
       .references(() => workspaces.id),
@@ -178,6 +182,56 @@ export const usage = pgTable(
     index("usage_workspace_idx").on(table.workspaceId),
     index("usage_time_idx").on(table.timeCreated),
     index("idx_usage_workspace_time").on(table.workspaceId, table.timeCreated),
+  ],
+)
+
+// ── Billing Ledger (append-only audit trail for all balance changes) ──
+
+export const billingLedger = pgTable(
+  "billing_ledger",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    type: text("type", {
+      enum: ["credit_purchase", "usage_deduction", "subscription_renewal", "refund", "adjustment", "onboarding"],
+    }).notNull(),
+    amountMicro: bigint("amount_micro", { mode: "number" }).notNull(), // positive = credit, negative = debit
+    balanceAfterMicro: bigint("balance_after_micro", { mode: "number" }).notNull(),
+    referenceId: text("reference_id"), // usage.id, payment.id, etc.
+    metadata: jsonb("metadata"),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+  },
+  (table) => [
+    index("idx_ledger_workspace_time").on(table.workspaceId, table.timeCreated),
+  ],
+)
+
+export const billingLedgerRelations = relations(billingLedger, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [billingLedger.workspaceId],
+    references: [workspaces.id],
+  }),
+}))
+
+// ── Usage Daily Rollup (populated by pg_cron) ──
+
+export const usageDaily = pgTable(
+  "usage_daily",
+  {
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    model: text("model").notNull(),
+    day: timestamp("day", { mode: "date" }).notNull(),
+    requestCount: integer("request_count").notNull().default(0),
+    inputTokens: bigint("input_tokens", { mode: "number" }).notNull().default(0),
+    outputTokens: bigint("output_tokens", { mode: "number" }).notNull().default(0),
+    costMicro: bigint("cost_micro", { mode: "number" }).notNull().default(0),
+  },
+  (table) => [
+    // Primary key is (workspace_id, model, day) — defined in SQL migration
   ],
 )
 

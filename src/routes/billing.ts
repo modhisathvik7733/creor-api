@@ -8,7 +8,7 @@ import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.
 import { createCheckout, updateSubscription, cancelSubscription, getSubscription as getLsSubscription } from "../lib/lemonsqueezy.ts"
 import { createId } from "../lib/id.ts"
 import { MICRO, SYMBOL, CURRENCY, microToDisplay } from "../lib/currency.ts"
-import { checkQuota } from "../lib/quota.ts"
+import { checkQuota, ensureBilling } from "../lib/quota.ts"
 import { logAudit } from "../lib/audit.ts"
 
 export const billingRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
@@ -19,25 +19,8 @@ billingRoutes.use("*", requireAuth)
 
 billingRoutes.get("/", async (c) => {
   const auth = c.get("auth")
-  let result = await db
-    .select()
-    .from(billing)
-    .where(eq(billing.workspaceId, auth.workspaceId))
-    .then((rows) => rows[0])
-
-  // Auto-create billing record if missing (legacy accounts)
-  if (!result) {
-    await db.insert(billing).values({
-      id: createId("bill"),
-      workspaceId: auth.workspaceId,
-    })
-    result = await db
-      .select()
-      .from(billing)
-      .where(eq(billing.workspaceId, auth.workspaceId))
-      .then((rows) => rows[0])
-    if (!result) return c.json({ error: "Failed to initialize billing" }, 500)
-  }
+  const result = await ensureBilling(auth.workspaceId)
+  if (!result) return c.json({ error: "Failed to initialize billing" }, 500)
 
   // Get active plan
   const sub = await db
@@ -65,7 +48,9 @@ billingRoutes.get("/", async (c) => {
 billingRoutes.get("/quota", async (c) => {
   const auth = c.get("auth")
   const result = await checkQuota(auth.workspaceId)
-  return c.json(result)
+  // Strip internal fields from API response
+  const { _effectiveLimitMicro, _monthlyUsageMicro, _balanceMicro, ...publicResult } = result
+  return c.json(publicResult)
 })
 
 // ── Add credits (Lemon Squeezy checkout with custom_price) ──
@@ -467,6 +452,50 @@ billingRoutes.get("/payments", async (c) => {
     }),
     page,
     limit,
+  })
+})
+
+// ── Plans catalog (public, cacheable) ──
+
+billingRoutes.get("/plans", async (c) => {
+  const allPlans = await db
+    .select()
+    .from(plans)
+    .orderBy(plans.id)
+
+  const result = allPlans.map((p) => {
+    const prices = p.prices as Record<string, number> | null
+    const features = p.features as string[] | null
+    return {
+      id: p.id,
+      name: p.name,
+      price: prices?.["USD"] ? (prices["USD"] as number) / 100 : 0,
+      currency: CURRENCY,
+      monthlyLimit: p.monthlyLimit ? microToDisplay(p.monthlyLimit) : null,
+      features: features ?? [],
+    }
+  })
+
+  c.header("Cache-Control", "public, max-age=300") // 5 min cache
+  return c.json({ plans: result })
+})
+
+// ── Realtime config (returns Supabase connection details for billing subscriptions) ──
+
+billingRoutes.get("/realtime-config", async (c) => {
+  const supabaseUrl = process.env.CREOR_SUPABASE_URL || "https://uwhckbpjrpgopduiyeaw.supabase.co"
+  const anonKey = process.env.CREOR_SUPABASE_ANON_KEY
+
+  if (!anonKey) {
+    return c.json({ error: "Realtime not configured" }, 503)
+  }
+
+  const auth = c.get("auth")
+  return c.json({
+    supabaseUrl,
+    anonKey,
+    workspaceId: auth.workspaceId,
+    tables: ["billing", "subscriptions"],
   })
 })
 

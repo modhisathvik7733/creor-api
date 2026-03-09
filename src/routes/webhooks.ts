@@ -4,6 +4,7 @@ import { billing, subscriptions, webhookEvents, payments, plans } from "../db/sc
 import { eq, and, isNull, sql } from "drizzle-orm"
 import { verifyWebhookSignature, updateSubscription, type LSWebhookEvent } from "../lib/lemonsqueezy.ts"
 import { createId } from "../lib/id.ts"
+import { appendLedger } from "../lib/ledger.ts"
 
 export const webhookRoutes = new Hono()
 
@@ -65,9 +66,10 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
         .where(eq(billing.workspaceId, workspaceId))
 
       // Record payment
+      const paymentId = createId("pay")
       try {
         await db.insert(payments).values({
-          id: createId("pay"),
+          id: paymentId,
           workspaceId,
           userId: userId ?? null,
           type: "credits",
@@ -80,6 +82,12 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
       } catch {
         // Unique constraint — already recorded
       }
+
+      // Ledger entry for credit purchase
+      appendLedger(workspaceId, "credit_purchase", creditMicro, paymentId, {
+        usdAmount,
+        lsOrderId: String(entityId),
+      })
 
       break
     }
@@ -176,7 +184,7 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
 
       await db
         .update(subscriptions)
-        .set({ graceUntil: endsAt })
+        .set({ graceUntil: endsAt, status: "cancelled" })
         .where(and(
           eq(subscriptions.lsSubscriptionId, lsSubscriptionId),
           isNull(subscriptions.timeDeleted),
@@ -261,9 +269,10 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
           amountSmallest = prices?.["USD"] ?? 0
         }
 
+        const renewPaymentId = createId("pay")
         try {
           await db.insert(payments).values({
-            id: createId("pay"),
+            id: renewPaymentId,
             workspaceId: sub.workspaceId,
             userId: sub.userId,
             type: "subscription",
@@ -275,6 +284,22 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
           })
         } catch {
           // Already recorded
+        }
+
+        // Ledger entry for subscription renewal
+        if (billingReason === "renewal") {
+          appendLedger(sub.workspaceId, "subscription_renewal", 0, renewPaymentId, {
+            plan: sub.plan,
+            amountSmallest,
+          })
+        }
+
+        // Clear past_due status on successful payment
+        if (sub.status === "past_due") {
+          await db
+            .update(subscriptions)
+            .set({ status: "active" })
+            .where(eq(subscriptions.id, sub.id))
         }
 
         // Execute pending downgrade if scheduled
@@ -315,8 +340,22 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
     }
 
     case "subscription_payment_failed": {
-      // Recurring charge failed — log for now
-      console.warn(`[webhook] subscription_payment_failed: ${entityId}`)
+      // Recurring charge failed — mark subscription as past_due for dunning
+      const failAttrs = event.data.attributes as Record<string, unknown>
+      const failSubId = failAttrs.subscription_id ? String(failAttrs.subscription_id) : null
+
+      if (failSubId) {
+        await db
+          .update(subscriptions)
+          .set({ status: "past_due" })
+          .where(and(
+            eq(subscriptions.lsSubscriptionId, failSubId),
+            isNull(subscriptions.timeDeleted),
+          ))
+        console.warn(`[webhook] subscription_payment_failed: ${entityId} — marked as past_due`)
+      } else {
+        console.warn(`[webhook] subscription_payment_failed: ${entityId} — no subscription ID`)
+      }
       break
     }
 
@@ -344,6 +383,12 @@ webhookRoutes.post("/lemonsqueezy", async (c) => {
           .update(payments)
           .set({ status: "refunded" })
           .where(eq(payments.id, payment.id))
+
+        // Ledger entry for refund
+        appendLedger(payment.workspaceId, "refund", -debitMicro, payment.id, {
+          lsOrderId,
+          originalAmount: payment.amountSmallest,
+        })
       }
 
       break

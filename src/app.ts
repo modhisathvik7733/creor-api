@@ -42,15 +42,17 @@ app.use(
   }),
 )
 
-// Rate limiting
-app.use("*", rateLimit({ windowMs: 60_000, max: 300 }))
+// Rate limiting (distributed via Upstash Redis, falls back to in-memory)
+app.use("*", rateLimit({ prefix: "global", windowSec: 60, max: 300 }))
 app.use("/api/auth/*", rateLimit({
-  windowMs: 60_000,
+  prefix: "auth",
+  windowSec: 60,
   max: 20,
   keyFn: (c: any) => c.req.header("x-forwarded-for") ?? c.req.header("cf-connecting-ip") ?? "unknown",
 }))
 app.use("/v1/*", rateLimit({
-  windowMs: 60_000,
+  prefix: "gateway",
+  windowSec: 60,
   max: 60,
   keyFn: (c: any) => c.req.header("Authorization")?.replace("Bearer ", "") ?? "unknown",
 }))

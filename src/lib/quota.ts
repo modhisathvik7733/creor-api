@@ -1,6 +1,7 @@
 import { db } from "../db/client.ts"
 import { billing, subscriptions, plans, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull } from "drizzle-orm"
+import { createId } from "./id.ts"
 import { MICRO, CURRENCY, SYMBOL, microToDisplay } from "./currency.ts"
 
 export interface QuotaResult {
@@ -19,6 +20,38 @@ export interface QuotaResult {
   blockReason: string | null
   warnings: string[]
   overageActive: boolean
+  /** Internal: effective plan limit in micro-units (used by gateway) */
+  _effectiveLimitMicro: number | null
+  /** Internal: monthly usage in micro-units (used by gateway for error responses) */
+  _monthlyUsageMicro: number
+  /** Internal: raw balance in micro-units */
+  _balanceMicro: number
+}
+
+/**
+ * Ensure a billing record exists for a workspace.
+ * Creates one if missing (for new workspaces or legacy accounts).
+ */
+export async function ensureBilling(workspaceId: string) {
+  let bill = await db
+    .select()
+    .from(billing)
+    .where(eq(billing.workspaceId, workspaceId))
+    .then((rows) => rows[0])
+
+  if (!bill) {
+    await db.insert(billing).values({
+      id: createId("bill"),
+      workspaceId,
+    }).onConflictDoNothing()
+    bill = await db
+      .select()
+      .from(billing)
+      .where(eq(billing.workspaceId, workspaceId))
+      .then((rows) => rows[0])
+  }
+
+  return bill ?? null
 }
 
 /**
@@ -26,11 +59,7 @@ export interface QuotaResult {
  * Shared between JWT-authenticated routes and API-key-authenticated gateway.
  */
 export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
-  const bill = await db
-    .select()
-    .from(billing)
-    .where(eq(billing.workspaceId, workspaceId))
-    .then((rows) => rows[0])
+  const bill = await ensureBilling(workspaceId)
 
   if (!bill) {
     return {
@@ -43,6 +72,9 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
       blockReason: "no_billing",
       warnings: [],
       overageActive: false,
+      _effectiveLimitMicro: null,
+      _monthlyUsageMicro: 0,
+      _balanceMicro: 0,
     }
   }
 
@@ -113,6 +145,11 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     warnings.push("low_credits")
   }
 
+  // Warn about past_due subscription (payment failed, retrying)
+  if (sub?.status === "past_due") {
+    warnings.push("payment_failed")
+  }
+
   const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
 
   const prices = userPlan?.prices as Record<string, number> | null
@@ -138,5 +175,8 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     blockReason,
     warnings,
     overageActive: overPlanLimit && (hasCredits || hasSubscription),
+    _effectiveLimitMicro: effectiveLimit,
+    _monthlyUsageMicro: monthlyUsage,
+    _balanceMicro: bill.balance,
   }
 }
