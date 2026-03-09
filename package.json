@@ -16,8 +16,6 @@
   },
   "dependencies": {
     "@hono/zod-validator": "^0.4.2",
-    "@upstash/ratelimit": "^2.0.8",
-    "@upstash/redis": "^1.36.4",
     "drizzle-orm": "^0.38.0",
     "hono": "^4.7.0",
     "jose": "^6.0.0",

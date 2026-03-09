@@ -11,9 +11,7 @@
     "postgres": "npm:postgres@^3.4.5",
     "jose": "npm:jose@^6.0.0",
     "zod": "npm:zod@^3.24.0",
-    "ulid": "npm:ulid@^2.3.0",
-    "@upstash/redis": "npm:@upstash/redis@^1.34.0",
-    "@upstash/ratelimit": "npm:@upstash/ratelimit@^2.0.0"
+    "ulid": "npm:ulid@^2.3.0"
   },
   "compilerOptions": {
     "lib": ["deno.ns", "esnext"]
