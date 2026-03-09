@@ -150,11 +150,10 @@ export async function trackStreamUsage(
                   tc.index = i
                   modified = true
                 }
-                // Strip extra_content (Google thought_signature)
-                if (tc.extra_content) {
-                  delete tc.extra_content
-                  modified = true
-                }
+                // Note: extra_content (thought_signature) is NOT stripped here.
+                // Google requires it back when sending tool results.
+                // The engine strips it client-side for AI SDK compatibility
+                // and re-injects it on outgoing requests.
               }
             }
 

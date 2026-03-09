@@ -184,7 +184,6 @@ gatewayRoutes.post("/chat/completions", async (c) => {
         if (toolCalls) {
           for (let i = 0; i < toolCalls.length; i++) {
             if (toolCalls[i].index === undefined) toolCalls[i].index = i
-            if (toolCalls[i].extra_content) delete toolCalls[i].extra_content
           }
         }
       }
