@@ -100,16 +100,20 @@ export async function trackStreamUsage(
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
   let accumulatedText = ""
 
+  const encoder = new TextEncoder()
+
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
 
-      await writer.write(value)
-
-      // Try to parse usage from SSE chunks
+      // Parse SSE chunks, extract usage, and strip provider-specific fields
       const text = decoder.decode(value, { stream: true })
-      for (const line of text.split("\n")) {
+      const lines = text.split("\n")
+      let cleaned = false
+      const outputLines: string[] = []
+
+      for (const line of lines) {
         if (line.startsWith("data: ") && line !== "data: [DONE]") {
           try {
             const chunk = JSON.parse(line.slice(6))
@@ -119,10 +123,39 @@ export async function trackStreamUsage(
               chunk.choices?.[0]?.delta?.content ??
               chunk.candidates?.[0]?.content?.parts?.[0]?.text
             if (delta) accumulatedText += delta
+
+            // Strip provider-specific fields that break AI SDK parsing
+            // (e.g. Google's extra_content.google.thought_signature)
+            if (chunk.choices) {
+              for (const choice of chunk.choices) {
+                const toolCalls = choice.delta?.tool_calls
+                if (toolCalls) {
+                  for (const tc of toolCalls) {
+                    if (tc.extra_content) {
+                      delete tc.extra_content
+                      cleaned = true
+                    }
+                  }
+                }
+              }
+            }
+
+            // Re-serialize cleaned chunk
+            if (cleaned) {
+              outputLines.push("data: " + JSON.stringify(chunk))
+              continue
+            }
           } catch {
-            // ignore parse errors
+            // ignore parse errors, pass through as-is
           }
         }
+        outputLines.push(line)
+      }
+
+      if (cleaned) {
+        await writer.write(encoder.encode(outputLines.join("\n")))
+      } else {
+        await writer.write(value)
       }
     }
   } finally {
