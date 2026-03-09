@@ -101,6 +101,7 @@ export async function trackStreamUsage(
 
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
   let accumulatedText = ""
+  let sawToolCalls = false // Track across the entire stream
 
   try {
     while (true) {
@@ -134,12 +135,14 @@ export async function trackStreamUsage(
           chunk.candidates?.[0]?.content?.parts?.[0]?.text
         if (delta) accumulatedText += delta
 
-        // Normalize Google-specific fields on tool_calls
+        // Normalize Google-specific fields
         let modified = false
         if (chunk.choices) {
           for (const choice of chunk.choices) {
+            // Track and normalize tool_calls
             const toolCalls = choice.delta?.tool_calls
             if (toolCalls) {
+              sawToolCalls = true
               for (let i = 0; i < toolCalls.length; i++) {
                 const tc = toolCalls[i]
                 // Inject missing index (Google omits it, AI SDK requires it)
@@ -153,6 +156,13 @@ export async function trackStreamUsage(
                   modified = true
                 }
               }
+            }
+
+            // Fix finish_reason: Google may send "stop" for tool call responses,
+            // but the AI SDK/engine expects "tool_calls" to continue the loop
+            if (sawToolCalls && choice.finish_reason && choice.finish_reason !== "tool_calls") {
+              choice.finish_reason = "tool_calls"
+              modified = true
             }
           }
         }
