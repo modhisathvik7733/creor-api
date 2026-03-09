@@ -124,13 +124,19 @@ export async function trackStreamUsage(
               chunk.candidates?.[0]?.content?.parts?.[0]?.text
             if (delta) accumulatedText += delta
 
-            // Strip provider-specific fields that break AI SDK parsing
-            // (e.g. Google's extra_content.google.thought_signature)
+            // Normalize provider-specific fields that break AI SDK parsing
             if (chunk.choices) {
               for (const choice of chunk.choices) {
                 const toolCalls = choice.delta?.tool_calls
                 if (toolCalls) {
-                  for (const tc of toolCalls) {
+                  for (let i = 0; i < toolCalls.length; i++) {
+                    const tc = toolCalls[i]
+                    // Inject missing index (Google omits it, AI SDK requires it)
+                    if (tc.index === undefined) {
+                      tc.index = i
+                      cleaned = true
+                    }
+                    // Strip extra_content (Google thought_signature)
                     if (tc.extra_content) {
                       delete tc.extra_content
                       cleaned = true
