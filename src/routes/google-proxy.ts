@@ -156,7 +156,8 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
   const upstreamUrl = `https://generativelanguage.googleapis.com${path}`
   const upstreamHeaders = new Headers()
   upstreamHeaders.set("Content-Type", c.req.header("Content-Type") || "application/json")
-  upstreamHeaders.set("Authorization", `Bearer ${googleKey}`)
+  // Google's native API uses x-goog-api-key header (not Bearer token)
+  upstreamHeaders.set("x-goog-api-key", googleKey)
 
   const isStream = path.includes("streamGenerateContent")
   const requestId = crypto.randomUUID()
