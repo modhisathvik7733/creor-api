@@ -189,3 +189,68 @@ export async function trackStreamUsage(
     }
   }
 }
+
+/**
+ * Track usage from a Google-native streaming (SSE) response.
+ * Google's format: data: {"candidates": [...], "usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": N}}
+ * usageMetadata typically appears on the last chunk.
+ * This is a pure pass-through — no field normalization needed (the @ai-sdk/google SDK handles that).
+ */
+export async function trackGoogleStreamUsage(
+  upstream: ReadableStream<Uint8Array>,
+  writable: WritableStream<Uint8Array>,
+  ctx: CostContext,
+) {
+  const reader = upstream.getReader()
+  const writer = writable.getWriter()
+  const decoder = new TextDecoder()
+
+  let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
+  let accumulatedText = ""
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      // Pass through the raw bytes unchanged
+      await writer.write(value)
+
+      // Parse SSE lines to extract usage metadata (for billing)
+      const text = decoder.decode(value, { stream: true })
+      for (const line of text.split("\n")) {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue
+
+        let chunk: any
+        try {
+          chunk = JSON.parse(line.slice(6))
+        } catch {
+          continue
+        }
+
+        // Extract usage from Google's native format
+        if (chunk.usageMetadata) {
+          lastUsage = {
+            prompt_tokens: chunk.usageMetadata.promptTokenCount ?? 0,
+            completion_tokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
+          }
+        }
+
+        // Accumulate text for fallback estimation
+        const parts = chunk.candidates?.[0]?.content?.parts
+        if (parts) {
+          for (const part of parts) {
+            if (part.text) accumulatedText += part.text
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[google-proxy] stream pipe error for ${ctx.model}:`, err)
+  } finally {
+    try { await writer.close() } catch { /* client disconnected */ }
+    if (lastUsage || (accumulatedText && accumulatedText.length > 10)) {
+      trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
+    }
+  }
+}

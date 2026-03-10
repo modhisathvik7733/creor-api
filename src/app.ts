@@ -10,6 +10,7 @@ import { modelRoutes } from "./routes/models.ts"
 import { usageRoutes } from "./routes/usage.ts"
 import { shareRoutes } from "./routes/share.ts"
 import { gatewayRoutes } from "./routes/gateway.ts"
+import { googleProxyRoutes } from "./routes/google-proxy.ts"
 import { webhookRoutes } from "./routes/webhooks.ts"
 import { userRoutes } from "./routes/user.ts"
 import { adminRoutes } from "./routes/admin.ts"
@@ -56,6 +57,12 @@ app.use("/v1/*", rateLimit({
   max: 60,
   keyFn: (c: any) => c.req.header("Authorization")?.replace("Bearer ", "") ?? "unknown",
 }))
+app.use("/google/*", rateLimit({
+  prefix: "gateway",
+  windowSec: 60,
+  max: 60,
+  keyFn: (c: any) => c.req.header("Authorization")?.replace("Bearer ", "") ?? "unknown",
+}))
 
 // Health check
 app.get("/health", (c) =>
@@ -82,6 +89,9 @@ app.route("/api/marketplace", marketplaceRoutes)
 
 // LLM Gateway (separate path for AI SDK compatibility)
 app.route("/v1", gatewayRoutes)
+
+// Google Native API Proxy (for @ai-sdk/google via gateway)
+app.route("/google", googleProxyRoutes)
 
 // 404 fallback
 app.notFound((c) => c.json({ error: "Not found" }, 404))

@@ -98,3 +98,12 @@ export async function resolveProvider(
 
   return null
 }
+
+/**
+ * Get Google API key for a workspace (BYOK or environment fallback).
+ * Used by the Google native proxy route.
+ */
+export async function getGoogleApiKey(workspaceId: string): Promise<string | null> {
+  const byokKey = await getByokKey(workspaceId, "google")
+  return byokKey ?? process.env.GOOGLE_AI_API_KEY ?? null
+}
