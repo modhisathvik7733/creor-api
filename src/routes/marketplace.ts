@@ -346,6 +346,7 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
 
   const rows = await db
     .select({
+      id: mcpInstallations.id,
       mcpName: mcpInstallations.mcpName,
       config: mcpInstallations.config,
       configValues: mcpInstallations.configValues,
@@ -355,7 +356,6 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     .where(
       and(
         eq(mcpInstallations.workspaceId, auth.workspaceId),
-        eq(mcpInstallations.enabled, true),
         isNull(mcpInstallations.timeDeleted),
       ),
     )
@@ -379,6 +379,14 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
         // Skip if decryption fails
       }
     }
+
+    // Inject enabled=false for disabled MCPs so engine can distinguish
+    // "installed but disabled" from "not installed"
+    if (!row.enabled) {
+      config.enabled = false
+    }
+    // Include installation ID for bidirectional toggle sync
+    config._installationId = row.id
 
     result[row.mcpName] = config
   }
