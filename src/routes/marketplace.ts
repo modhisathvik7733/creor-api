@@ -222,9 +222,8 @@ marketplaceRoutes.post("/installations", zValidator("json", installSchema), asyn
       metadata: { catalogSlug: body.catalogSlug, mcpName },
     })
 
-    // Invalidate caches
+    // Invalidate catalog cache
     catalogCache = null
-    invalidateSyncCache(auth.workspaceId)
 
     return c.json({ id, mcpName }, 201)
   } catch (err) {
@@ -295,8 +294,6 @@ marketplaceRoutes.patch(
       metadata: { enabled: body.enabled },
     })
 
-    invalidateSyncCache(auth.workspaceId)
-
     return c.json({ success: true })
   },
 )
@@ -339,29 +336,13 @@ marketplaceRoutes.delete("/installations/:id", async (c) => {
   })
 
   catalogCache = null
-  invalidateSyncCache(auth.workspaceId)
 
   return c.json({ success: true })
 })
 
-// ── Per-workspace sync cache (30s TTL) ──
-const syncCache = new Map<string, { data: Record<string, unknown>; ts: number }>()
-const SYNC_CACHE_TTL = 30_000
-
-/** Invalidate sync cache for a workspace (call on install/uninstall/update) */
-export function invalidateSyncCache(workspaceId: string) {
-  syncCache.delete(workspaceId)
-}
-
 // Engine sync — returns resolved MCP configs
 marketplaceRoutes.get("/installations/sync", async (c) => {
   const auth = c.get("auth")
-
-  // Check cache first
-  const cached = syncCache.get(auth.workspaceId)
-  if (cached && Date.now() - cached.ts < SYNC_CACHE_TTL) {
-    return c.json(cached.data)
-  }
 
   const rows = await db
     .select({
@@ -402,7 +383,6 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     result[row.mcpName] = config
   }
 
-  syncCache.set(auth.workspaceId, { data: result, ts: Date.now() })
   return c.json(result)
 })
 

@@ -5,4 +5,5 @@ dist/
 .env.*.local
 *.log
 .DS_Store
+bun.lock
 drizzle/meta/

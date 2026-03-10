@@ -9,7 +9,7 @@ const dbUrl = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL
 const isEdgeFunction = !!process.env.SUPABASE_DB_URL
 const poolConfig = isEdgeFunction
   ? { max: 3, connect_timeout: 10, idle_timeout: 20 }
-  : { max: 25, connect_timeout: 5, idle_timeout: 60 }
+  : { max: 10, connect_timeout: 5, idle_timeout: 60 }
 
 const client = dbUrl
   ? postgres(dbUrl, {
