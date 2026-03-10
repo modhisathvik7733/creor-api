@@ -51,7 +51,7 @@ export async function trackUsageAsync(
   try {
     // Atomic: increment monthly counter + deduct overage from balance
     await db.execute(
-      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}, ${costMicro}, ${ctx.planLimit})`,
+      sql`SELECT * FROM increment_usage_and_deduct(${ctx.keyData.workspaceId}::TEXT, ${costMicro}::BIGINT, ${ctx.planLimit}::BIGINT)`,
     )
 
     // Insert usage row (idempotent via request_id unique constraint)

@@ -7,6 +7,16 @@ const authCache = new Map<string, { result: GatewayAuth; expires: number }>()
 const AUTH_TTL = 30_000 // 30 seconds
 
 /**
+ * Check if an API key has a valid cached auth result.
+ * Used by speculative execution to decide if we can start upstream early.
+ */
+export function getCachedAuth(apiKey: string): GatewayAuth | null {
+  const cached = authCache.get(apiKey)
+  if (cached && Date.now() < cached.expires) return cached.result
+  return null
+}
+
+/**
  * Authenticate a gateway API key (crk_ prefix).
  * Returns the key owner's workspace info, or null if invalid.
  * Caches valid keys for 30s to avoid per-request DB lookups.

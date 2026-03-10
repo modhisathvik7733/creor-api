@@ -5,12 +5,16 @@ import * as schema from "./schema.ts"
 // Use SUPABASE_DB_URL (auto-provided in edge functions) or fall back to individual params
 const dbUrl = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL
 
+// Dedicated server (Fly.io) can hold more connections than edge functions
+const isEdgeFunction = !!process.env.SUPABASE_DB_URL
+const poolConfig = isEdgeFunction
+  ? { max: 3, connect_timeout: 10, idle_timeout: 20 }
+  : { max: 25, connect_timeout: 5, idle_timeout: 60 }
+
 const client = dbUrl
   ? postgres(dbUrl, {
       prepare: false,
-      max: 3,               // edge functions have limited connections
-      connect_timeout: 10,  // fail fast on connection issues (seconds)
-      idle_timeout: 20,     // release idle connections (seconds)
+      ...poolConfig,
     })
   : (() => {
       if (!process.env.DB_HOST || !process.env.DB_PASSWORD) {
@@ -24,9 +28,7 @@ const client = dbUrl
         password: process.env.DB_PASSWORD,
         prepare: false,
         ssl: "require",
-        max: 3,
-        connect_timeout: 10,
-        idle_timeout: 20,
+        ...poolConfig,
       })
     })()
 

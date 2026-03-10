@@ -11,6 +11,37 @@ export type AuthContext = {
   role: "owner" | "admin" | "member"
 }
 
+// ── In-memory cache for API key auth ──
+// Avoids two DB hits (keys + users) on every API key request.
+
+const API_KEY_CACHE_MAX = 500
+const API_KEY_CACHE_TTL_MS = 60_000 // 60 seconds
+
+interface ApiKeyCacheEntry {
+  auth: AuthContext
+  expiresAt: number
+}
+
+const apiKeyCache = new Map<string, ApiKeyCacheEntry>()
+
+function apiKeyCacheGet(key: string): AuthContext | undefined {
+  const entry = apiKeyCache.get(key)
+  if (!entry) return undefined
+  if (Date.now() > entry.expiresAt) {
+    apiKeyCache.delete(key)
+    return undefined
+  }
+  return entry.auth
+}
+
+function apiKeyCacheSet(key: string, auth: AuthContext) {
+  if (apiKeyCache.size >= API_KEY_CACHE_MAX) {
+    const firstKey = apiKeyCache.keys().next().value
+    if (firstKey !== undefined) apiKeyCache.delete(firstKey)
+  }
+  apiKeyCache.set(key, { auth, expiresAt: Date.now() + API_KEY_CACHE_TTL_MS })
+}
+
 // ── In-memory LRU cache for session validation ──
 // Avoids a DB hit on every authenticated request.
 
@@ -67,6 +98,14 @@ export const requireAuth = createMiddleware<{
 
   // ── API Key auth (crk_ prefix) ──
   if (token.startsWith("crk_")) {
+    // Check cache first
+    const cached = apiKeyCacheGet(token)
+    if (cached) {
+      c.set("auth", cached)
+      await next()
+      return
+    }
+
     const apiKey = await db
       .select({
         id: keys.id,
@@ -99,12 +138,14 @@ export const requireAuth = createMiddleware<{
     // Update last-used timestamp (fire-and-forget)
     db.update(keys).set({ timeUsed: new Date() }).where(eq(keys.id, apiKey.id)).catch(() => {})
 
-    c.set("auth", {
+    const authCtx: AuthContext = {
       userId: user.id,
       workspaceId: user.workspaceId,
       email: user.email,
       role: user.role as AuthContext["role"],
-    })
+    }
+    apiKeyCacheSet(token, authCtx)
+    c.set("auth", authCtx)
     await next()
     return
   }
