@@ -43,8 +43,10 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
   }
 
   // ── 2. Extract model from URL path ──
-  // Path: /v1beta/models/gemini-3-flash:streamGenerateContent
-  const path = c.req.path.replace(/^\/google/, "")
+  // Path: /v1beta/models/gemini-3-flash:streamGenerateContent?alt=sse
+  // Must preserve query params (?alt=sse is required for SSE streaming)
+  const reqUrl = new URL(c.req.url)
+  const path = reqUrl.pathname.replace(/^\/google/, "") + reqUrl.search
   const modelMatch = path.match(/\/models\/([^/:]+)/)
   const modelId = modelMatch?.[1]
   const fullModelId = modelId ? `google/${modelId}` : null
