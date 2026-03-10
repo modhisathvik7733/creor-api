@@ -380,10 +380,13 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
       }
     }
 
-    // Inject enabled=false for disabled MCPs so engine can distinguish
-    // "installed but disabled" from "not installed"
+    // Always sync the enabled state from the DB column into the config.
+    // The config JSON might have a stale `enabled` value from a previous toggle,
+    // so we always override it with the authoritative DB column value.
     if (!row.enabled) {
       config.enabled = false
+    } else {
+      delete config.enabled  // Remove stale enabled:false from config JSON
     }
     // Include installation ID for bidirectional toggle sync
     config._installationId = row.id
