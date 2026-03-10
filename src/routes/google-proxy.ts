@@ -177,9 +177,17 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
     if (!upstreamRes.ok) {
       const errorBody = await upstreamRes.text()
       console.error(`[google-proxy] upstream ${upstreamRes.status} for ${fullModelId}: ${errorBody.slice(0, 200)}`)
+      // Forward retry-after headers so the engine can respect Google's rate limit delays
+      const errorHeaders: Record<string, string> = {
+        "Content-Type": upstreamRes.headers.get("Content-Type") || "application/json",
+      }
+      const retryAfter = upstreamRes.headers.get("retry-after")
+      if (retryAfter) errorHeaders["retry-after"] = retryAfter
+      const retryAfterMs = upstreamRes.headers.get("retry-after-ms")
+      if (retryAfterMs) errorHeaders["retry-after-ms"] = retryAfterMs
       return new Response(errorBody, {
         status: upstreamRes.status,
-        headers: { "Content-Type": upstreamRes.headers.get("Content-Type") || "application/json" },
+        headers: errorHeaders,
       })
     }
 
