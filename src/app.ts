@@ -20,6 +20,7 @@ import { catalogRoutes } from "./routes/catalog.ts"
 import { projectRoutes } from "./routes/projects.ts"
 import { providerRoutes } from "./routes/providers.ts"
 import { marketplaceRoutes } from "./routes/marketplace.ts"
+import { updateRoutes } from "./routes/update.ts"
 
 const app = new Hono()
 
@@ -68,6 +69,9 @@ app.use("/google/*", rateLimit({
 app.get("/health", (c) =>
   c.json({ status: "ok", version: "0.1.0", timestamp: new Date().toISOString() }),
 )
+
+// Auto-update endpoint (public, no auth — VS Code update service calls this)
+app.route("/", updateRoutes)
 
 // API routes
 app.route("/api/auth", authRoutes)
