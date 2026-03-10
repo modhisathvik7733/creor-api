@@ -14,7 +14,7 @@ primary_region = "iad"
   [checks.health]
     port = 3001
     type = "http"
-    interval = "10s"
+    interval = "30s"
     timeout = "2s"
     path = "/health"
 
