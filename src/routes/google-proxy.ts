@@ -219,8 +219,9 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
       })
     }
 
-    return c.json(responseJson, {
+    return new Response(JSON.stringify(responseJson), {
       status: upstreamRes.status,
+      headers: { "Content-Type": "application/json" },
     })
   } catch (err: any) {
     console.error("[google-proxy] upstream error:", err?.message ?? err)
