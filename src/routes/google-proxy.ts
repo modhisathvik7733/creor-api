@@ -1,11 +1,11 @@
 import { Hono } from "hono"
-import { checkQuotaFast } from "../lib/quota"
-import { microToDisplay } from "../lib/currency"
-import { authenticateApiKey } from "../lib/gateway/authenticate"
-import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement"
-import { getGoogleApiKey } from "../lib/gateway/provider"
-import { trackGoogleStreamUsage, trackUsageAsync } from "../lib/gateway/track-usage"
-import type { CostContext } from "../lib/gateway/types"
+import { checkQuotaFast } from "../lib/quota.ts"
+import { microToDisplay } from "../lib/currency.ts"
+import { authenticateApiKey } from "../lib/gateway/authenticate.ts"
+import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement.ts"
+import { getGoogleApiKey } from "../lib/gateway/provider.ts"
+import { trackGoogleStreamUsage, trackUsageAsync } from "../lib/gateway/track-usage.ts"
+import type { CostContext } from "../lib/gateway/types.ts"
 
 export const googleProxyRoutes = new Hono()
 
