@@ -1,11 +1,11 @@
 import { Hono } from "hono"
-import { microToDisplay } from "../lib/currency.ts"
-import { checkQuotaFast } from "../lib/quota.ts"
-import { authenticateApiKey } from "../lib/gateway/authenticate.ts"
-import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement.ts"
-import { resolveProvider } from "../lib/gateway/provider.ts"
-import { trackUsageAsync, trackStreamUsage } from "../lib/gateway/track-usage.ts"
-import type { CostContext } from "../lib/gateway/types.ts"
+import { microToDisplay } from "../lib/currency"
+import { checkQuotaFast } from "../lib/quota"
+import { authenticateApiKey } from "../lib/gateway/authenticate"
+import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement"
+import { resolveProvider } from "../lib/gateway/provider"
+import { trackUsageAsync, trackStreamUsage } from "../lib/gateway/track-usage"
+import type { CostContext } from "../lib/gateway/types"
 
 export const gatewayRoutes = new Hono()
 
@@ -209,10 +209,11 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
     trackUsageAsync(costCtx, responseJson.usage)
 
-    return c.json(responseJson, {
-      status: upstreamRes.status,
-      headers: Object.fromEntries(responseHeaders.entries()),
-    })
+    return c.json(
+      responseJson,
+      upstreamRes.status as any,
+      Object.fromEntries(responseHeaders.entries())
+    )
   } catch (err: any) {
     return c.json(
       { error: { type: "GatewayError", message: `Upstream error: ${err.message}` } },

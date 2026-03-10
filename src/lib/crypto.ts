@@ -43,15 +43,18 @@ async function getKeyBytes(): Promise<Uint8Array> {
   }
   // Derive a 32-byte key from JWT_SECRET via SHA-256
   const encoded = new TextEncoder().encode(jwtSecret)
-  const hash = await crypto.subtle.digest("SHA-256", encoded)
+  const hash = await crypto.subtle.digest("SHA-256", encoded as BufferSource)
   return new Uint8Array(hash)
 }
 
 async function importKey(keyBytes: Uint8Array): Promise<CryptoKey> {
-  return crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
-  ])
+  return crypto.subtle.importKey(
+    "raw",
+    keyBytes as BufferSource,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"],
+  )
 }
 
 /**
@@ -69,7 +72,7 @@ export async function encrypt(plaintext: string): Promise<string> {
   const ciphertext = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv: iv as BufferSource },
     key,
-    encoded,
+    encoded as BufferSource,
   )
 
   // Combine: iv (12) + ciphertext+tag (variable)
