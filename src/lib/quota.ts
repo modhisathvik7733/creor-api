@@ -181,12 +181,19 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
   }
 }
 
+// ── Quota cache (10s TTL, keyed by workspaceId) ──
+const quotaCache = new Map<string, { result: QuotaResult; expires: number }>()
+const QUOTA_TTL = 10_000 // 10 seconds
+
 /**
  * Fast-path quota check for the gateway hot path.
  * Uses a single SQL query instead of 4 sequential ones.
- * Returns only what the gateway needs (canSend, plan, costs).
+ * Cached for 10s per workspace to avoid redundant DB hits during rapid tool call sequences.
  */
 export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> {
+  const cached = quotaCache.get(workspaceId)
+  if (cached && Date.now() < cached.expires) return cached.result
+
   const rows = await db.execute(sql`
     SELECT
       b.balance,
@@ -272,7 +279,7 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
   const prices = row.plan_prices as Record<string, number> | null
   const planPrice = prices?.["USD"] ? (prices["USD"] as number) / 100 : null
 
-  return {
+  const result: QuotaResult = {
     balance: microToDisplay(balance),
     currency: CURRENCY,
     symbol: SYMBOL,
@@ -296,4 +303,7 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
     _monthlyUsageMicro: monthlyUsage,
     _balanceMicro: balance,
   }
+
+  quotaCache.set(workspaceId, { result, expires: Date.now() + QUOTA_TTL })
+  return result
 }

@@ -1,6 +1,5 @@
 import { db } from "../../db/client.ts"
-import { keys } from "../../db/schema.ts"
-import { eq, and, isNull } from "drizzle-orm"
+import { sql } from "drizzle-orm"
 import type { GatewayAuth } from "./types.ts"
 
 // ── In-memory cache for API key auth (same key used many times per session) ──
@@ -11,6 +10,7 @@ const AUTH_TTL = 30_000 // 30 seconds
  * Authenticate a gateway API key (crk_ prefix).
  * Returns the key owner's workspace info, or null if invalid.
  * Caches valid keys for 30s to avoid per-request DB lookups.
+ * Uses raw SQL instead of Drizzle query builder for faster execution on Deno.
  */
 export async function authenticateApiKey(apiKey: string): Promise<GatewayAuth | null> {
   const now = Date.now()
@@ -19,22 +19,19 @@ export async function authenticateApiKey(apiKey: string): Promise<GatewayAuth | 
     return cached.result
   }
 
-  const keyData = await db
-    .select({
-      id: keys.id,
-      workspaceId: keys.workspaceId,
-      userId: keys.userId,
-    })
-    .from(keys)
-    .where(and(eq(keys.key, apiKey), isNull(keys.timeDeleted)))
-    .then((rows) => rows[0])
+  const rows = await db.execute(sql`
+    SELECT id, workspace_id, user_id FROM keys
+    WHERE key = ${apiKey} AND time_deleted IS NULL
+    LIMIT 1
+  `)
 
-  if (!keyData) return null
+  const row = rows[0]
+  if (!row) return null
 
   const result: GatewayAuth = {
-    keyId: keyData.id,
-    workspaceId: keyData.workspaceId,
-    userId: keyData.userId,
+    keyId: row.id as string,
+    workspaceId: row.workspace_id as string,
+    userId: row.user_id as string,
   }
 
   authCache.set(apiKey, { result, expires: now + AUTH_TTL })
