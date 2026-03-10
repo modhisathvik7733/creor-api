@@ -24,10 +24,19 @@ gatewayRoutes.post("/chat/completions", async (c) => {
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 
-  const [auth, body] = await Promise.all([
-    authenticateApiKey(apiKey),
-    c.req.json(),
-  ])
+  let auth, body
+  try {
+    ;[auth, body] = await Promise.all([
+      authenticateApiKey(apiKey),
+      c.req.json(),
+    ])
+  } catch (err: any) {
+    console.error("[gateway] auth/parse error:", err?.message ?? err)
+    return c.json(
+      { error: { type: "GatewayError", message: "Service temporarily unavailable" } },
+      503,
+    )
+  }
 
   if (!auth) {
     return c.json({ error: { type: "AuthError", message: "Invalid API key" } }, 401)
@@ -41,11 +50,20 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   }
 
   // ── 2. Parallel: quota + model config + provider resolution ──
-  const [quota, modelConfig, providerConfig] = await Promise.all([
-    checkQuotaFast(auth.workspaceId),
-    getModelConfig(model),
-    resolveProvider(model, auth.workspaceId),
-  ])
+  let quota, modelConfig, providerConfig
+  try {
+    ;[quota, modelConfig, providerConfig] = await Promise.all([
+      checkQuotaFast(auth.workspaceId),
+      getModelConfig(model),
+      resolveProvider(model, auth.workspaceId),
+    ])
+  } catch (err: any) {
+    console.error("[gateway] db lookup error:", err?.message ?? err)
+    return c.json(
+      { error: { type: "GatewayError", message: "Service temporarily unavailable" } },
+      503,
+    )
+  }
 
   // ── 3. Check quota ──
   if (!quota.canSend) {
@@ -211,12 +229,31 @@ gatewayRoutes.get("/billing/quota", async (c) => {
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 
-  const auth = await authenticateApiKey(apiKey)
+  let auth
+  try {
+    auth = await authenticateApiKey(apiKey)
+  } catch (err: any) {
+    console.error("[gateway] billing auth error:", err?.message ?? err)
+    return c.json(
+      { error: { type: "GatewayError", message: "Service temporarily unavailable" } },
+      503,
+    )
+  }
+
   if (!auth) {
     return c.json({ error: { type: "AuthError", message: "Invalid API key" } }, 401)
   }
 
-  const result = await checkQuotaFast(auth.workspaceId)
+  let result
+  try {
+    result = await checkQuotaFast(auth.workspaceId)
+  } catch (err: any) {
+    console.error("[gateway] billing quota error:", err?.message ?? err)
+    return c.json(
+      { error: { type: "GatewayError", message: "Service temporarily unavailable" } },
+      503,
+    )
+  }
 
   // Strip internal fields from API response
   const { _effectiveLimitMicro, _monthlyUsageMicro, _balanceMicro, ...publicResult } = result
