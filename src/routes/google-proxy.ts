@@ -249,8 +249,9 @@ async function proxyToGoogle(c: any, opts: {
     if (opts.isStream && upstreamRes.body) {
       const responseHeaders = new Headers()
       responseHeaders.set("Content-Type", upstreamRes.headers.get("Content-Type") || "text/event-stream")
-      responseHeaders.set("Cache-Control", "no-cache")
+      responseHeaders.set("Cache-Control", "no-cache, no-transform")
       responseHeaders.set("Connection", "keep-alive")
+      responseHeaders.set("X-Accel-Buffering", "no")
 
       const { readable, writable } = new TransformStream()
       trackGoogleStreamUsage(upstreamRes.body, writable, costCtx)

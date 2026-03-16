@@ -44,6 +44,17 @@ app.use(
   }),
 )
 
+// Prevent proxy/CDN buffering for SSE streaming responses
+app.use("*", async (c, next) => {
+  await next()
+  const ct = c.res.headers.get("content-type") || ""
+  if (ct.includes("text/event-stream")) {
+    // Force identity encoding to prevent gzip/brotli buffering
+    c.res.headers.set("Content-Encoding", "identity")
+    c.res.headers.set("X-Content-Type-Options", "nosniff")
+  }
+})
+
 // Rate limiting (distributed via Upstash Redis, falls back to in-memory)
 app.use("*", rateLimit({ prefix: "global", windowSec: 60, max: 300 }))
 app.use("/api/auth/*", rateLimit({

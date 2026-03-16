@@ -266,6 +266,29 @@ marketplaceRoutes.patch(
     }
 
     if (body.configValues) {
+      // Re-validate required config params against catalog schema
+      const [catalogItem] = await db
+        .select({ configParams: mcpCatalog.configParams })
+        .from(mcpCatalog)
+        .where(eq(mcpCatalog.id, installation.catalogId))
+
+      if (catalogItem) {
+        const params = (catalogItem.configParams as Array<{ key: string; required: boolean }>) ?? []
+        // Merge existing values with new values for validation
+        let existingValues: Record<string, string> = {}
+        if (installation.configValues) {
+          try {
+            existingValues = JSON.parse(await decrypt(installation.configValues))
+          } catch { /* use empty */ }
+        }
+        const mergedValues = { ...existingValues, ...body.configValues }
+        for (const param of params) {
+          if (param.required && !mergedValues[param.key]) {
+            return c.json({ error: `Missing required config: ${param.key}` }, 400)
+          }
+        }
+      }
+
       // Re-encrypt values
       updates.configValues = await encrypt(JSON.stringify(body.configValues))
 
@@ -476,13 +499,41 @@ marketplaceRoutes.post(
   },
 )
 
+const catalogUpdateSchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  description: z.string().min(1).optional(),
+  category: z.string().min(1).optional(),
+  icon: z.string().optional(),
+  author: z.string().optional(),
+  sourceUrl: z.string().optional(),
+  docsUrl: z.string().optional(),
+  serverType: z.enum(["local", "remote"]).optional(),
+  configTemplate: z.record(z.unknown()).optional(),
+  configParams: z.array(
+    z.object({
+      key: z.string(),
+      label: z.string(),
+      placeholder: z.string(),
+      required: z.boolean(),
+      secret: z.boolean(),
+      helpUrl: z.string().optional(),
+    }),
+  ).optional(),
+  tags: z.array(z.string()).optional(),
+  featured: z.boolean().optional(),
+  verified: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  sortOrder: z.number().optional(),
+})
+
 marketplaceRoutes.patch(
   "/catalog/:slug",
   requireAuth,
   requireAdmin,
+  zValidator("json", catalogUpdateSchema),
   async (c) => {
     const slug = c.req.param("slug")
-    const body = await c.req.json()
+    const body = c.req.valid("json")
 
     await db
       .update(mcpCatalog)

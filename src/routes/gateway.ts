@@ -5,7 +5,7 @@ import { authenticateApiKey, getCachedAuth } from "../lib/gateway/authenticate.t
 import { getModelConfig, getFallbackPricing, meetsMinPlan } from "../lib/gateway/entitlement.ts"
 import { resolveProvider } from "../lib/gateway/provider.ts"
 import { trackUsageAsync, trackStreamUsage } from "../lib/gateway/track-usage.ts"
-import type { CostContext } from "../lib/gateway/types.ts"
+import type { CostContext, ProviderConfig } from "../lib/gateway/types.ts"
 
 export const gatewayRoutes = new Hono()
 
@@ -85,9 +85,9 @@ gatewayRoutes.post("/chat/completions", async (c) => {
       return c.json({ error: { type: "ModelError", message: `Model ${model} not supported` } }, 400)
     }
 
-    // Build upstream request
+    // Build upstream request (strip unsupported params per provider)
     const upstreamUrl = `${providerConfig.baseUrl}${providerConfig.path}`
-    const upstreamBody = { ...body, model: providerConfig.upstreamModel }
+    const upstreamBody = sanitizeBody(body, providerConfig)
     const upstreamHeaders = new Headers()
     upstreamHeaders.set("Content-Type", "application/json")
     providerConfig.setAuth(upstreamHeaders)
@@ -166,7 +166,7 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 
   const requestId = crypto.randomUUID()
   const upstreamUrl = `${providerConfig.baseUrl}${providerConfig.path}`
-  const upstreamBody = { ...body, model: providerConfig.upstreamModel }
+  const upstreamBody = sanitizeBody(body, providerConfig)
   const upstreamHeaders = new Headers()
   upstreamHeaders.set("Content-Type", "application/json")
   providerConfig.setAuth(upstreamHeaders)
@@ -188,6 +188,20 @@ gatewayRoutes.post("/chat/completions", async (c) => {
 })
 
 // ── Shared helpers ──
+
+/** Strip params unsupported by specific upstream providers. */
+function sanitizeBody(body: any, provider: ProviderConfig) {
+  const cleaned = { ...body, model: provider.upstreamModel }
+  if (provider.provider === "google") {
+    delete cleaned.frequency_penalty
+    delete cleaned.presence_penalty
+    delete cleaned.logit_bias
+    delete cleaned.logprobs
+    delete cleaned.top_logprobs
+    delete cleaned.seed
+  }
+  return cleaned
+}
 
 function quotaError(c: any, quota: any) {
   const now = new Date()
@@ -293,8 +307,11 @@ async function proxyUpstream(c: any, opts: {
     )
 
     if (opts.isStream) {
-      responseHeaders.set("Cache-Control", "no-cache")
+      // Force SSE Content-Type regardless of upstream (prevents proxy buffering)
+      responseHeaders.set("Content-Type", "text/event-stream; charset=utf-8")
+      responseHeaders.set("Cache-Control", "no-cache, no-transform")
       responseHeaders.set("Connection", "keep-alive")
+      responseHeaders.set("X-Accel-Buffering", "no")
 
       const { readable, writable } = new TransformStream()
       trackStreamUsage(upstreamRes.body!, writable, costCtx)
