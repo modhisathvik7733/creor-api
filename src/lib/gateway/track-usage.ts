@@ -99,14 +99,36 @@ export async function trackStreamUsage(
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
 
+  // Send SSE comments as keepalive to prevent idle timeout during long
+  // thinking phases (e.g., Gemini 3.1 Pro can think for 3-5+ minutes
+  // with no data, causing Supabase/Deno proxy to reset the connection).
+  const HEARTBEAT_INTERVAL = 15_000 // 15 seconds
+  const heartbeat = encoder.encode(": heartbeat\n\n")
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+  const startHeartbeat = () => {
+    stopHeartbeat()
+    heartbeatTimer = setInterval(() => {
+      writer.write(heartbeat).catch(() => {})
+    }, HEARTBEAT_INTERVAL)
+  }
+  const stopHeartbeat = () => {
+    if (heartbeatTimer !== undefined) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = undefined
+    }
+  }
+
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
   let accumulatedText = ""
   let sawToolCalls = false // Track across the entire stream
 
   try {
+    startHeartbeat()
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      // Reset heartbeat timer on each chunk (upstream is active)
+      startHeartbeat()
 
       const text = decoder.decode(value, { stream: true })
       const lines = text.split("\n")
@@ -183,6 +205,7 @@ export async function trackStreamUsage(
   } catch (err) {
     console.error(`[gateway] stream pipe error for ${ctx.model}:`, err)
   } finally {
+    stopHeartbeat()
     try { await writer.close() } catch { /* client disconnected */ }
     if (lastUsage || (accumulatedText && accumulatedText.length > 10)) {
       trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
@@ -204,14 +227,34 @@ export async function trackGoogleStreamUsage(
   const reader = upstream.getReader()
   const writer = writable.getWriter()
   const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+
+  // Keepalive heartbeat to prevent idle timeout during long thinking phases
+  const HEARTBEAT_INTERVAL = 15_000
+  const heartbeat = encoder.encode(": heartbeat\n\n")
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+  const startHeartbeat = () => {
+    stopHeartbeat()
+    heartbeatTimer = setInterval(() => {
+      writer.write(heartbeat).catch(() => {})
+    }, HEARTBEAT_INTERVAL)
+  }
+  const stopHeartbeat = () => {
+    if (heartbeatTimer !== undefined) {
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = undefined
+    }
+  }
 
   let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined
   let accumulatedText = ""
 
   try {
+    startHeartbeat()
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      startHeartbeat()
 
       // Pass through the raw bytes unchanged
       await writer.write(value)
@@ -248,6 +291,7 @@ export async function trackGoogleStreamUsage(
   } catch (err) {
     console.error(`[google-proxy] stream pipe error for ${ctx.model}:`, err)
   } finally {
+    stopHeartbeat()
     try { await writer.close() } catch { /* client disconnected */ }
     if (lastUsage || (accumulatedText && accumulatedText.length > 10)) {
       trackUsageAsync(ctx, lastUsage, lastUsage ? undefined : accumulatedText || undefined)
