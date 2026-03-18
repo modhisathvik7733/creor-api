@@ -3,6 +3,7 @@ import { billing, subscriptions, plans, systemConfig } from "../db/schema.ts"
 import { eq, and, isNull, sql } from "drizzle-orm"
 import { createId } from "./id.ts"
 import { MICRO, CURRENCY, SYMBOL, microToDisplay } from "./currency.ts"
+import { getCreditSummary } from "./ledger.ts"
 
 export interface QuotaResult {
   balance: number
@@ -20,6 +21,16 @@ export interface QuotaResult {
   blockReason: string | null
   warnings: string[]
   overageActive: boolean
+  /** Credit activity for the current billing month (null on fast-path) */
+  credits: {
+    added: number
+    spent: number
+    balance: number
+  } | null
+  /** Custom workspace spend limit in whole USD (null = using plan default) */
+  spendLimit: number | null
+  /** Plan's default monthly limit in display USD */
+  planLimit: number | null
   /** Internal: effective plan limit in micro-units (used by gateway) */
   _effectiveLimitMicro: number | null
   /** Internal: monthly usage in micro-units (used by gateway for error responses) */
@@ -72,6 +83,9 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
       blockReason: "no_billing",
       warnings: [],
       overageActive: false,
+      credits: null,
+      spendLimit: null,
+      planLimit: null,
       _effectiveLimitMicro: null,
       _monthlyUsageMicro: 0,
       _balanceMicro: 0,
@@ -155,6 +169,9 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
   const prices = userPlan?.prices as Record<string, number> | null
   const planPrice = prices?.["USD"] ? (prices["USD"] as number) / 100 : null
 
+  // Credit activity for current month
+  const creditSummary = await getCreditSummary(workspaceId)
+
   return {
     balance: microToDisplay(bill.balance),
     currency: CURRENCY,
@@ -175,6 +192,13 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     blockReason,
     warnings,
     overageActive: overPlanLimit && (hasCredits || hasSubscription),
+    credits: {
+      added: microToDisplay(creditSummary.addedMicro),
+      spent: microToDisplay(creditSummary.spentMicro),
+      balance: microToDisplay(bill.balance),
+    },
+    spendLimit: bill.monthlyLimit ?? null,
+    planLimit: microToDisplay(planLimitMicro),
     _effectiveLimitMicro: effectiveLimit,
     _monthlyUsageMicro: monthlyUsage,
     _balanceMicro: bill.balance,
@@ -228,6 +252,9 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
       blockReason: "no_billing",
       warnings: [],
       overageActive: false,
+      credits: null,
+      spendLimit: null,
+      planLimit: null,
       _effectiveLimitMicro: null,
       _monthlyUsageMicro: 0,
       _balanceMicro: 0,
@@ -299,6 +326,9 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
     blockReason,
     warnings,
     overageActive: overPlanLimit && (hasCredits || hasSubscription),
+    credits: null, // Skipped on fast path to avoid extra query
+    spendLimit: null,
+    planLimit: null,
     _effectiveLimitMicro: effectiveLimit,
     _monthlyUsageMicro: monthlyUsage,
     _balanceMicro: balance,

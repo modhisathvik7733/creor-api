@@ -418,7 +418,7 @@ billingRoutes.patch("/limit", requireAdmin, zValidator("json", limitSchema), asy
     .set({ monthlyLimit, timeUpdated: new Date() })
     .where(eq(billing.workspaceId, auth.workspaceId))
 
-  return c.json({ success: true })
+  return c.json({ success: true, monthlyLimit })
 })
 
 // ── Payment history ──
