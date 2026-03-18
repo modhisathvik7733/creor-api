@@ -1,6 +1,6 @@
 import { Hono } from "hono"
 import { db } from "../db/client.ts"
-import { models } from "../db/schema.ts"
+import { models, systemConfig } from "../db/schema.ts"
 import { eq } from "drizzle-orm"
 
 export const modelRoutes = new Hono()
@@ -8,6 +8,13 @@ export const modelRoutes = new Hono()
 // ── List available models (from DB) ──
 
 modelRoutes.get("/", async (c) => {
+  const defaultRow = await db
+    .select()
+    .from(systemConfig)
+    .where(eq(systemConfig.key, "default_model"))
+    .then((r) => r[0])
+  const defaultModelId = (defaultRow?.value as string) ?? null
+
   const rows = await db
     .select()
     .from(models)
@@ -26,6 +33,7 @@ modelRoutes.get("/", async (c) => {
       capabilities: m.capabilities,
       minPlan: m.minPlan,
       sortOrder: m.sortOrder,
+      isDefault: m.id === defaultModelId,
     })),
   })
 })
