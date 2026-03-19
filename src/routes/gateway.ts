@@ -21,6 +21,13 @@ gatewayRoutes.post("/chat/completions", async (c) => {
   // ── 1. Extract API key ──
   const apiKey = c.req.header("Authorization")?.replace("Bearer ", "")
   if (!apiKey) {
+    const authHeader = c.req.header("Authorization")
+    console.error("[gateway] Missing API key", {
+      hasAuthHeader: !!authHeader,
+      authHeaderPrefix: authHeader ? authHeader.substring(0, 10) + "..." : "none",
+      url: c.req.url,
+      userAgent: c.req.header("User-Agent"),
+    })
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 
@@ -206,16 +213,32 @@ function sanitizeBody(body: any, provider: ProviderConfig) {
 function quotaError(c: any, quota: any) {
   const now = new Date()
   const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+
+  let message: string
+  switch (quota.blockReason) {
+    case "free_limit_no_credits":
+      message = "Free tier limit reached. Subscribe or add credits to continue."
+      break
+    case "no_billing":
+      message = "No billing record found. Please set up billing."
+      break
+    case "extra_usage_disabled":
+      message = "Plan limit reached. Enable Extra Usage in settings to continue using credits."
+      break
+    case "no_credits":
+      message = "Plan limit reached and no credits remaining. Add credits to continue."
+      break
+    default:
+      message = "Usage limit reached. Add credits or upgrade your plan."
+  }
+
   return c.json(
     {
       error: {
         type: "LimitError",
+        blockReason: quota.blockReason,
         plan: quota.plan.id,
-        message: quota.blockReason === "free_limit_no_credits"
-          ? "Free tier limit reached. Subscribe or add credits to continue."
-          : quota.blockReason === "no_billing"
-            ? "No billing record found. Please set up billing."
-            : "Overage limit reached. Add credits to continue.",
+        message,
         monthlyUsage: microToDisplay(quota._monthlyUsageMicro),
         monthlyLimit: quota._effectiveLimitMicro !== null
           ? microToDisplay(quota._effectiveLimitMicro)
@@ -314,7 +337,22 @@ async function proxyUpstream(c: any, opts: {
       responseHeaders.set("X-Accel-Buffering", "no")
 
       const { readable, writable } = new TransformStream()
-      trackStreamUsage(upstreamRes.body!, writable, costCtx)
+
+      // Upstream retry: when connection resets during thinking before content is sent
+      const retryUpstream = async (): Promise<ReadableStream<Uint8Array> | null> => {
+        try {
+          const retryRes = await fetch(opts.upstreamUrl, {
+            method: "POST",
+            headers: opts.upstreamHeaders,
+            body: JSON.stringify(opts.upstreamBody),
+            signal: opts.signal,
+          })
+          if (!retryRes.ok || !retryRes.body) return null
+          return retryRes.body
+        } catch { return null }
+      }
+
+      trackStreamUsage(upstreamRes.body!, writable, costCtx, retryUpstream)
 
       return new Response(readable, {
         status: upstreamRes.status,
@@ -354,6 +392,7 @@ async function proxyUpstream(c: any, opts: {
 gatewayRoutes.get("/billing/quota", async (c) => {
   const apiKey = c.req.header("Authorization")?.replace("Bearer ", "")
   if (!apiKey) {
+    console.error("[gateway/billing] Missing API key", { url: c.req.url })
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 

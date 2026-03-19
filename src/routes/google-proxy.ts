@@ -24,6 +24,12 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
   // ── 1. Extract API key + URL info (no async) ──
   const apiKey = c.req.header("Authorization")?.replace("Bearer ", "")
   if (!apiKey) {
+    const authHeader = c.req.header("Authorization")
+    console.error("[google-proxy] Missing API key", {
+      hasAuthHeader: !!authHeader,
+      authHeaderPrefix: authHeader ? authHeader.substring(0, 10) + "..." : "none",
+      url: c.req.url,
+    })
     return c.json({ error: { type: "AuthError", message: "Missing API key" } }, 401)
   }
 
@@ -143,16 +149,32 @@ googleProxyRoutes.all("/v1beta/*", async (c) => {
 function googleQuotaError(c: any, quota: any) {
   const now = new Date()
   const resetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1))
+
+  let message: string
+  switch (quota.blockReason) {
+    case "free_limit_no_credits":
+      message = "Free tier limit reached. Subscribe or add credits to continue."
+      break
+    case "no_billing":
+      message = "No billing record found. Please set up billing."
+      break
+    case "extra_usage_disabled":
+      message = "Plan limit reached. Enable Extra Usage in settings to continue using credits."
+      break
+    case "no_credits":
+      message = "Plan limit reached and no credits remaining. Add credits to continue."
+      break
+    default:
+      message = "Usage limit reached. Add credits or upgrade your plan."
+  }
+
   return c.json(
     {
       error: {
         type: "LimitError",
+        blockReason: quota.blockReason,
         plan: quota.plan.id,
-        message: quota.blockReason === "free_limit_no_credits"
-          ? "Free tier limit reached. Subscribe or add credits to continue."
-          : quota.blockReason === "no_billing"
-            ? "No billing record found. Please set up billing."
-            : "Overage limit reached. Add credits to continue.",
+        message,
         monthlyUsage: microToDisplay(quota._monthlyUsageMicro),
         monthlyLimit: quota._effectiveLimitMicro !== null
           ? microToDisplay(quota._effectiveLimitMicro)
@@ -254,7 +276,28 @@ async function proxyToGoogle(c: any, opts: {
       responseHeaders.set("X-Accel-Buffering", "no")
 
       const { readable, writable } = new TransformStream()
-      trackGoogleStreamUsage(upstreamRes.body, writable, costCtx)
+
+      // Upstream retry: when the connection to Google resets during thinking
+      // (before any content is sent), re-fetch from Google with a fresh connection.
+      const retryUpstream = async (): Promise<ReadableStream<Uint8Array> | null> => {
+        try {
+          const retryRes = await fetch(upstreamUrl, {
+            method: c.req.method,
+            headers: upstreamHeaders,
+            body: opts.body.byteLength > 0 ? opts.body : undefined,
+          })
+          if (!retryRes.ok || !retryRes.body) {
+            console.error(`[google-proxy] upstream retry failed: ${retryRes.status}`)
+            return null
+          }
+          return retryRes.body
+        } catch (err: any) {
+          console.error(`[google-proxy] upstream retry fetch error:`, err?.message)
+          return null
+        }
+      }
+
+      trackGoogleStreamUsage(upstreamRes.body, writable, costCtx, retryUpstream)
 
       return new Response(readable, {
         status: upstreamRes.status,

@@ -129,18 +129,15 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
   const warnings: string[] = []
 
   if (overPlanLimit && !canUseCredits) {
-    if (hasSubscription) {
-      const overageUsed = monthlyUsage - effectiveLimit!
-      const maxOverage = effectiveLimit!
-      if (overageUsed >= maxOverage) {
-        canSend = false
-        blockReason = "overage_limit"
-      } else {
-        warnings.push("using_overage")
-      }
+    // No credits or extra usage disabled → block regardless of subscription
+    canSend = false
+    if (!hasSubscription && !hasCredits) {
+      blockReason = "free_limit_no_credits"
+    } else if (!extraUsageEnabled) {
+      blockReason = "extra_usage_disabled"
     } else {
-      canSend = false
-      blockReason = hasCredits ? "extra_usage_disabled" : "free_limit_no_credits"
+      // extraUsageEnabled but no credits
+      blockReason = "no_credits"
     }
   }
 
@@ -196,7 +193,7 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     canSend,
     blockReason,
     warnings,
-    overageActive: overPlanLimit && (canUseCredits || hasSubscription),
+    overageActive: overPlanLimit && canUseCredits,
     credits: {
       added: microToDisplay(creditSummary.addedMicro),
       spent: microToDisplay(creditSummary.spentMicro),
@@ -290,17 +287,15 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
   const warnings: string[] = []
 
   if (overPlanLimit && !canUseCredits) {
-    if (hasSubscription) {
-      const overageUsed = monthlyUsage - effectiveLimit!
-      if (overageUsed >= effectiveLimit!) {
-        canSend = false
-        blockReason = "overage_limit"
-      } else {
-        warnings.push("using_overage")
-      }
+    // No credits or extra usage disabled → block regardless of subscription
+    canSend = false
+    if (!hasSubscription && !hasCredits) {
+      blockReason = "free_limit_no_credits"
+    } else if (!extraUsageEnabled) {
+      blockReason = "extra_usage_disabled"
     } else {
-      canSend = false
-      blockReason = hasCredits ? "extra_usage_disabled" : "free_limit_no_credits"
+      // extraUsageEnabled but no credits
+      blockReason = "no_credits"
     }
   }
 
@@ -335,7 +330,7 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
     canSend,
     blockReason,
     warnings,
-    overageActive: overPlanLimit && (canUseCredits || hasSubscription),
+    overageActive: overPlanLimit && canUseCredits,
     credits: null, // Skipped on fast path to avoid extra query
     spendLimit: null,
     planLimit: null,
