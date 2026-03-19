@@ -3,7 +3,7 @@ import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { db } from "../db/client.ts"
 import { keys } from "../db/schema.ts"
-import { eq, and, isNull } from "drizzle-orm"
+import { eq, and, isNull, ne } from "drizzle-orm"
 import { requireAuth, type AuthContext } from "../middleware/auth.ts"
 import { createId } from "../lib/id.ts"
 import { logAudit } from "../lib/audit.ts"
@@ -25,7 +25,7 @@ keyRoutes.get("/", async (c) => {
       timeCreated: keys.timeCreated,
     })
     .from(keys)
-    .where(and(eq(keys.workspaceId, auth.workspaceId), isNull(keys.timeDeleted)))
+    .where(and(eq(keys.workspaceId, auth.workspaceId), isNull(keys.timeDeleted), ne(keys.source, "ide")))
 
   // Mask keys — only show prefix
   const masked = result.map((k) => ({
@@ -36,15 +36,24 @@ keyRoutes.get("/", async (c) => {
   return c.json(masked)
 })
 
+// ── Validate API key ──
+// If requireAuth passes, the key is valid. Used by the IDE to check
+// if a stored key is still active before reusing it on re-login.
+
+keyRoutes.post("/validate", async (c) => {
+  return c.json({ valid: true })
+})
+
 // ── Create API key ──
 
 const createKeySchema = z.object({
   name: z.string().min(1).max(100),
+  source: z.enum(["user", "ide"]).optional().default("user"),
 })
 
 keyRoutes.post("/", zValidator("json", createKeySchema), async (c) => {
   const auth = c.get("auth")
-  const { name } = c.req.valid("json")
+  const { name, source } = c.req.valid("json")
 
   const id = createId("key")
   const key = `crk_${crypto.randomUUID().replace(/-/g, "")}`
@@ -55,6 +64,7 @@ keyRoutes.post("/", zValidator("json", createKeySchema), async (c) => {
     userId: auth.userId,
     name,
     key,
+    source,
   })
 
   void logAudit({
@@ -75,6 +85,17 @@ keyRoutes.post("/", zValidator("json", createKeySchema), async (c) => {
 keyRoutes.delete("/:id", async (c) => {
   const auth = c.get("auth")
   const keyId = c.req.param("id")
+
+  // Block deletion of IDE-managed keys
+  const [existing] = await db
+    .select({ source: keys.source })
+    .from(keys)
+    .where(and(eq(keys.id, keyId), eq(keys.workspaceId, auth.workspaceId)))
+    .limit(1)
+
+  if (existing?.source === "ide") {
+    return c.json({ error: "Cannot delete IDE-managed keys" }, 403)
+  }
 
   await db
     .update(keys)

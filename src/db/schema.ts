@@ -80,6 +80,7 @@ export const keys = pgTable(
       .references(() => users.id),
     name: text("name").notNull(),
     key: text("key").notNull().unique(),
+    source: text("source").notNull().default("user"), // 'user' = web-created, 'ide' = auto-created by IDE
     timeUsed: timestamp("time_used"),
     timeCreated: timestamp("time_created").defaultNow().notNull(),
     timeDeleted: timestamp("time_deleted"),
