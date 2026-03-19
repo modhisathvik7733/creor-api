@@ -164,6 +164,9 @@ function googleQuotaError(c: any, quota: any) {
     case "no_credits":
       message = "Plan limit reached and no credits remaining. Add credits to continue."
       break
+    case "overage_limit":
+      message = "Monthly spend limit reached. Increase your limit or wait for reset."
+      break
     default:
       message = "Usage limit reached. Add credits or upgrade your plan."
   }

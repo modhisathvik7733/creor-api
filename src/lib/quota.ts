@@ -119,17 +119,22 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
   const workspaceLimitMicro = bill.monthlyLimit ? bill.monthlyLimit * MICRO : null
   const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
 
-  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
   const hasCredits = bill.balance > 0
   const extraUsageEnabled = bill.extraUsageEnabled ?? false
   const canUseCredits = hasCredits && extraUsageEnabled
+
+  // Two thresholds:
+  // - planLimitMicro: the plan's included usage (block here when extra usage OFF)
+  // - effectiveLimit: the spend limit cap (block here when extra usage ON, uses credits for overage)
+  const overPlanIncluded = monthlyUsage >= planLimitMicro
+  const overSpendLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
 
   let canSend = true
   let blockReason: string | null = null
   const warnings: string[] = []
 
-  if (overPlanLimit && !canUseCredits) {
-    // No credits or extra usage disabled → block regardless of subscription
+  if (overPlanIncluded && !canUseCredits) {
+    // Over plan's included usage and can't use credits → block
     canSend = false
     if (!hasSubscription && !hasCredits) {
       blockReason = "free_limit_no_credits"
@@ -139,14 +144,18 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
       // extraUsageEnabled but no credits
       blockReason = "no_credits"
     }
+  } else if (overSpendLimit && canUseCredits) {
+    // Over the spend limit cap even with credits → block
+    canSend = false
+    blockReason = "overage_limit"
   }
 
-  if (overPlanLimit && canUseCredits) {
+  if (overPlanIncluded && canUseCredits && !overSpendLimit) {
     warnings.push("using_credits")
   }
 
-  if (effectiveLimit !== null && monthlyUsage > 0 && !overPlanLimit) {
-    const pct = Math.round((monthlyUsage / effectiveLimit) * 100)
+  if (planLimitMicro > 0 && monthlyUsage > 0 && !overPlanIncluded) {
+    const pct = Math.round((monthlyUsage / planLimitMicro) * 100)
     if (pct >= 80) warnings.push("monthly_approaching")
   }
 
@@ -193,7 +202,7 @@ export async function checkQuota(workspaceId: string): Promise<QuotaResult> {
     canSend,
     blockReason,
     warnings,
-    overageActive: overPlanLimit && canUseCredits,
+    overageActive: overPlanIncluded && canUseCredits,
     credits: {
       added: microToDisplay(creditSummary.addedMicro),
       spent: microToDisplay(creditSummary.spentMicro),
@@ -278,16 +287,21 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
   const workspaceLimitMicro = row.workspace_limit ? Number(row.workspace_limit) * MICRO : null
   const effectiveLimit = workspaceLimitMicro ?? planLimitMicro
 
-  const overPlanLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
   const hasCredits = balance > 0
   const canUseCredits = hasCredits && extraUsageEnabled
+
+  // Two thresholds:
+  // - planLimitMicro: the plan's included usage (block here when extra usage OFF)
+  // - effectiveLimit: the spend limit cap (block here when extra usage ON, uses credits for overage)
+  const overPlanIncluded = monthlyUsage >= planLimitMicro
+  const overSpendLimit = effectiveLimit !== null && monthlyUsage >= effectiveLimit
 
   let canSend = true
   let blockReason: string | null = null
   const warnings: string[] = []
 
-  if (overPlanLimit && !canUseCredits) {
-    // No credits or extra usage disabled → block regardless of subscription
+  if (overPlanIncluded && !canUseCredits) {
+    // Over plan's included usage and can't use credits → block
     canSend = false
     if (!hasSubscription && !hasCredits) {
       blockReason = "free_limit_no_credits"
@@ -297,9 +311,13 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
       // extraUsageEnabled but no credits
       blockReason = "no_credits"
     }
+  } else if (overSpendLimit && canUseCredits) {
+    // Over the spend limit cap even with credits → block
+    canSend = false
+    blockReason = "overage_limit"
   }
 
-  if (overPlanLimit && canUseCredits) {
+  if (overPlanIncluded && canUseCredits && !overSpendLimit) {
     warnings.push("using_credits")
   }
 
@@ -330,7 +348,7 @@ export async function checkQuotaFast(workspaceId: string): Promise<QuotaResult> 
     canSend,
     blockReason,
     warnings,
-    overageActive: overPlanLimit && canUseCredits,
+    overageActive: overPlanIncluded && canUseCredits,
     credits: null, // Skipped on fast path to avoid extra query
     spendLimit: null,
     planLimit: null,
