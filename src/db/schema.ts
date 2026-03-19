@@ -112,6 +112,7 @@ export const billing = pgTable("billing", {
   monthlyUsage: bigint("monthly_usage", { mode: "number" }).default(0), // micro-units
   timeMonthlyReset: timestamp("time_monthly_reset").defaultNow(), // lazy reset at month boundary
   timeMonthlyUsageUpdated: timestamp("time_monthly_usage_updated"),
+  extraUsageEnabled: boolean("extra_usage_enabled").notNull().default(false),
   lsCustomerId: text("ls_customer_id"),
   lsSubscriptionId: text("ls_subscription_id"),
   timeCreated: timestamp("time_created").defaultNow().notNull(),

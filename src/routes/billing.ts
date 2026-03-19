@@ -421,6 +421,22 @@ billingRoutes.patch("/limit", requireAdmin, zValidator("json", limitSchema), asy
   return c.json({ success: true, monthlyLimit })
 })
 
+// ── Extra usage toggle ──
+
+billingRoutes.patch("/extra-usage", requireAdmin, zValidator("json", z.object({
+  enabled: z.boolean(),
+})), async (c) => {
+  const auth = c.get("auth")
+  const { enabled } = c.req.valid("json")
+
+  await db
+    .update(billing)
+    .set({ extraUsageEnabled: enabled, timeUpdated: new Date() })
+    .where(eq(billing.workspaceId, auth.workspaceId))
+
+  return c.json({ success: true, extraUsageEnabled: enabled })
+})
+
 // ── Payment history ──
 
 billingRoutes.get("/payments", async (c) => {
