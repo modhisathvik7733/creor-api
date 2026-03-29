@@ -21,7 +21,7 @@ marketplaceRoutes.get("/catalog", async (c) => {
   const category = c.req.query("category")
   const search = c.req.query("search")
   const featured = c.req.query("featured")
-  const limit = parseInt(c.req.query("limit") ?? "50")
+  const limit = parseInt(c.req.query("limit") ?? "25")
   const offset = parseInt(c.req.query("offset") ?? "0")
 
   // Skip cache if filtering
@@ -486,6 +486,12 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
         if (config.environment) {
           config.environment = {
             ...(config.environment as Record<string, string>),
+            ...secrets,
+          }
+        }
+        if (config.headers) {
+          config.headers = {
+            ...(config.headers as Record<string, string>),
             ...secrets,
           }
         }

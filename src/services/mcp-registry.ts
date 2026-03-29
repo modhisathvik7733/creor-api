@@ -3,8 +3,12 @@
  *
  * Fetches MCP servers from the official MCP Registry at
  * registry.modelcontextprotocol.io and maps them to Creor's catalog format.
- * Uses in-memory caching with 1-hour TTL.
+ * Uses L1 in-memory + L2 database cache so Edge Function cold starts are fast.
  */
+
+import { db } from "../db/client.ts"
+import { mcpRegistryCache } from "../db/schema.ts"
+import { eq } from "drizzle-orm"
 
 const REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0"
 const CACHE_TTL = 60 * 60 * 1000 // 1 hour
@@ -93,9 +97,9 @@ export interface CatalogEntry {
   source: "registry"
 }
 
-// ── Cache ──
+// ── L1 In-Memory Cache (within same Edge Function invocation) ──
 
-let cache: { entries: CatalogEntry[]; timestamp: number } | null = null
+let memCache: { entries: CatalogEntry[]; timestamp: number } | null = null
 
 // ── Fetch all pages from registry ──
 
@@ -292,6 +296,84 @@ function dedupeLatest(servers: RegistryServer[]): RegistryServer[] {
   return [...latest.values()]
 }
 
+// ── L2 Database Cache ──
+
+async function loadFromDb(): Promise<{ entries: CatalogEntry[]; timestamp: number } | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(mcpRegistryCache)
+      .where(eq(mcpRegistryCache.id, "singleton"))
+
+    if (!row || !row.refreshedAt || row.serverCount === 0) return null
+
+    return {
+      entries: row.entries as CatalogEntry[],
+      timestamp: new Date(row.refreshedAt).getTime(),
+    }
+  } catch (err) {
+    console.error("Failed to read registry cache from DB:", err)
+    return null
+  }
+}
+
+async function saveToDb(entries: CatalogEntry[]): Promise<void> {
+  try {
+    await db
+      .update(mcpRegistryCache)
+      .set({
+        entries: entries as unknown as Record<string, unknown>,
+        serverCount: entries.length,
+        refreshedAt: new Date(),
+      })
+      .where(eq(mcpRegistryCache.id, "singleton"))
+  } catch (err) {
+    console.error("Failed to write registry cache to DB:", err)
+  }
+}
+
+// ── Refresh: fetch from registry, process, cache ──
+
+async function refreshEntries(): Promise<CatalogEntry[]> {
+  const raw = await fetchAllServers()
+  const unique = dedupeLatest(raw)
+  const entries = unique
+    .map(mapToEntry)
+    .filter((e): e is CatalogEntry => e !== null && e.description.length > 0)
+  return entries
+}
+
+async function ensureCache(): Promise<CatalogEntry[]> {
+  // L1: in-memory (same invocation)
+  if (memCache && Date.now() - memCache.timestamp < CACHE_TTL) {
+    return memCache.entries
+  }
+
+  // L2: database (survives cold starts)
+  const dbCache = await loadFromDb()
+  if (dbCache && Date.now() - dbCache.timestamp < CACHE_TTL) {
+    memCache = dbCache
+    return dbCache.entries
+  }
+
+  // L3: fetch from registry
+  try {
+    const entries = await refreshEntries()
+    memCache = { entries, timestamp: Date.now() }
+    await saveToDb(entries)
+    return entries
+  } catch (err) {
+    console.error("Failed to fetch MCP registry:", err)
+    // Fall back to stale DB data or stale memory data
+    if (dbCache) {
+      memCache = dbCache
+      return dbCache.entries
+    }
+    if (memCache) return memCache.entries
+    return []
+  }
+}
+
 // ── Public API ──
 
 export async function getRegistryServers(opts?: {
@@ -301,22 +383,8 @@ export async function getRegistryServers(opts?: {
   offset?: number
   excludeSlugs?: Set<string>
 }): Promise<{ servers: CatalogEntry[]; total: number; hasMore: boolean }> {
-  // Refresh cache if stale
-  if (!cache || Date.now() - cache.timestamp > CACHE_TTL) {
-    try {
-      const raw = await fetchAllServers()
-      const unique = dedupeLatest(raw)
-      const entries = unique
-        .map(mapToEntry)
-        .filter((e): e is CatalogEntry => e !== null && e.description.length > 0)
-      cache = { entries, timestamp: Date.now() }
-    } catch (err) {
-      console.error("Failed to fetch MCP registry:", err)
-      if (!cache) return { servers: [], total: 0, hasMore: false }
-    }
-  }
-
-  let filtered = cache.entries
+  const allEntries = await ensureCache()
+  let filtered = allEntries
 
   // Exclude slugs already in local catalog (dedup)
   if (opts?.excludeSlugs?.size) {
@@ -341,7 +409,7 @@ export async function getRegistryServers(opts?: {
 
   const total = filtered.length
   const offset = opts?.offset ?? 0
-  const limit = opts?.limit ?? 50
+  const limit = opts?.limit ?? 25
   const page = filtered.slice(offset, offset + limit)
 
   return {
@@ -352,5 +420,5 @@ export async function getRegistryServers(opts?: {
 }
 
 export function invalidateRegistryCache(): void {
-  cache = null
+  memCache = null
 }

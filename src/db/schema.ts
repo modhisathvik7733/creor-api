@@ -589,6 +589,15 @@ export const mcpInstallations = pgTable(
   ],
 )
 
+// ── MCP Registry Cache (singleton row, survives Edge Function cold starts) ──
+
+export const mcpRegistryCache = pgTable("mcp_registry_cache", {
+  id: text("id").primaryKey().default("singleton"),
+  entries: jsonb("entries").notNull().default([]),
+  serverCount: integer("server_count").notNull().default(0),
+  refreshedAt: timestamp("refreshed_at").defaultNow().notNull(),
+})
+
 export const mcpInstallationsRelations = relations(mcpInstallations, ({ one }) => ({
   workspace: one(workspaces, {
     fields: [mcpInstallations.workspaceId],
