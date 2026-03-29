@@ -33,29 +33,20 @@ marketplaceRoutes.get("/catalog", async (c) => {
   }
 
   // 1. Fetch local curated servers (always featured)
-  let localQuery = db
-    .select()
-    .from(mcpCatalog)
-    .where(eq(mcpCatalog.enabled, true))
-    .orderBy(sql`sort_order ASC, install_count DESC`)
-    .$dynamic()
-
-  if (category) {
-    localQuery = localQuery.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.category, category)))
-  }
+  const conditions = [eq(mcpCatalog.enabled, true)]
+  if (category) conditions.push(eq(mcpCatalog.category, category))
   if (search) {
-    localQuery = localQuery.where(
-      and(
-        eq(mcpCatalog.enabled, true),
-        sql`(${mcpCatalog.name} ILIKE ${"%" + search + "%"} OR ${mcpCatalog.description} ILIKE ${"%" + search + "%"})`,
-      ),
+    conditions.push(
+      sql`(${mcpCatalog.name} ILIKE ${"%" + search + "%"} OR ${mcpCatalog.description} ILIKE ${"%" + search + "%"} OR ${mcpCatalog.slug} ILIKE ${"%" + search + "%"})`
     )
   }
-  if (featured === "true") {
-    localQuery = localQuery.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.featured, true)))
-  }
+  if (featured === "true") conditions.push(eq(mcpCatalog.featured, true))
 
-  const localRows = await localQuery
+  const localRows = await db
+    .select()
+    .from(mcpCatalog)
+    .where(and(...conditions))
+    .orderBy(sql`sort_order ASC, install_count DESC`)
 
   // Mark local servers with source="featured" and map logoUrl
   const localMapped = localRows.map((r: any) => ({
@@ -465,8 +456,11 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
       config: mcpInstallations.config,
       configValues: mcpInstallations.configValues,
       enabled: mcpInstallations.enabled,
+      catalogSlug: mcpCatalog.slug,
+      catalogName: mcpCatalog.name,
     })
     .from(mcpInstallations)
+    .leftJoin(mcpCatalog, eq(mcpInstallations.catalogId, mcpCatalog.id))
     .where(
       and(
         eq(mcpInstallations.workspaceId, auth.workspaceId),
@@ -511,7 +505,11 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     // Include installation ID for bidirectional toggle sync
     config._installationId = row.id
 
-    result[row.mcpName] = config
+    // Use catalog name (kebab-cased) as the key so the IDE shows a readable name
+    const displayName = row.catalogName
+      ? row.catalogName.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "")
+      : row.mcpName
+    result[displayName] = config
   }
 
   return c.json(result)
