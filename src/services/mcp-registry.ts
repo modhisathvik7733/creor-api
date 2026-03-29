@@ -158,8 +158,12 @@ function formatServerName(rawName: string): string {
 // ── Map registry server to Creor catalog format ──
 
 function deriveSlug(name: string): string {
-  const parts = name.split("/")
-  return parts[parts.length - 1]
+  // Use full name to avoid collisions (e.g., many servers are named "<org>/mcp")
+  // Strip common domain prefixes (com., ai., io., org., dev., net.)
+  const stripped = name
+    .replace(/^(com|ai|io|org|dev|net)\./i, "")
+    .replace(/^github\./i, "")
+  return stripped
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "-")
     .replace(/-+/g, "-")
