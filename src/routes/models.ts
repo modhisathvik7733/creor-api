@@ -8,12 +8,14 @@ export const modelRoutes = new Hono()
 // ── List available models (from DB) ──
 
 modelRoutes.get("/", async (c) => {
-  const defaultRow = await db
-    .select()
-    .from(systemConfig)
-    .where(eq(systemConfig.key, "default_model"))
-    .then((r) => r[0])
+  const [defaultRow, agentGenRow, tabCompleteRow] = await Promise.all([
+    db.select().from(systemConfig).where(eq(systemConfig.key, "default_model")).then((r) => r[0]),
+    db.select().from(systemConfig).where(eq(systemConfig.key, "agent_generate_model")).then((r) => r[0]),
+    db.select().from(systemConfig).where(eq(systemConfig.key, "tab_complete_model")).then((r) => r[0]),
+  ])
   const defaultModelId = (defaultRow?.value as string) ?? null
+  const agentGenerateModel = (agentGenRow?.value as string) ?? null
+  const tabCompleteModel = (tabCompleteRow?.value as string) ?? null
 
   const rows = await db
     .select()
@@ -35,6 +37,8 @@ modelRoutes.get("/", async (c) => {
       sortOrder: m.sortOrder,
       isDefault: m.id === defaultModelId,
     })),
+    agentGenerateModel,
+    tabCompleteModel,
   })
 })
 

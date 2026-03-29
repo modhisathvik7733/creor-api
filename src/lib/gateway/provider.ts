@@ -52,6 +52,7 @@ export async function resolveProvider(
   if (model.startsWith("anthropic/")) providerName = "anthropic"
   else if (model.startsWith("openai/")) providerName = "openai"
   else if (model.startsWith("google/")) providerName = "google"
+  else if (model.startsWith("groq/")) providerName = "groq"
 
   if (!providerName) return null
 
@@ -91,6 +92,18 @@ export async function resolveProvider(
       provider: "google",
       baseUrl: "https://generativelanguage.googleapis.com",
       path: "/v1beta/openai/chat/completions",
+      upstreamModel,
+      setAuth: (h) => h.set("Authorization", `Bearer ${apiKey}`),
+    }
+  }
+
+  if (model.startsWith("groq/")) {
+    const upstreamModel = model.replace("groq/", "")
+    const apiKey = byokKey ?? process.env.GROQ_API_KEY!
+    return {
+      provider: "groq",
+      baseUrl: "https://api.groq.com/openai",
+      path: "/v1/chat/completions",
       upstreamModel,
       setAuth: (h) => h.set("Authorization", `Bearer ${apiKey}`),
     }
