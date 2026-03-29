@@ -8,6 +8,7 @@ import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.
 import { createId } from "../lib/id.ts"
 import { encrypt, decrypt } from "../lib/crypto.ts"
 import { logAudit } from "../lib/audit.ts"
+import { getRegistryServers, type CatalogEntry } from "../services/mcp-registry.ts"
 
 export const marketplaceRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -20,16 +21,19 @@ marketplaceRoutes.get("/catalog", async (c) => {
   const category = c.req.query("category")
   const search = c.req.query("search")
   const featured = c.req.query("featured")
+  const limit = parseInt(c.req.query("limit") ?? "50")
+  const offset = parseInt(c.req.query("offset") ?? "0")
 
   // Skip cache if filtering
-  const useCache = !category && !search && !featured
+  const useCache = !category && !search && !featured && offset === 0
   if (useCache && catalogCache && Date.now() - catalogCache.timestamp < CATALOG_CACHE_TTL) {
     c.header("Cache-Control", "public, max-age=300")
     c.header("X-Cache", "HIT")
     return c.json(catalogCache.data)
   }
 
-  let query = db
+  // 1. Fetch local curated servers (always featured)
+  let localQuery = db
     .select()
     .from(mcpCatalog)
     .where(eq(mcpCatalog.enabled, true))
@@ -37,10 +41,10 @@ marketplaceRoutes.get("/catalog", async (c) => {
     .$dynamic()
 
   if (category) {
-    query = query.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.category, category)))
+    localQuery = localQuery.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.category, category)))
   }
   if (search) {
-    query = query.where(
+    localQuery = localQuery.where(
       and(
         eq(mcpCatalog.enabled, true),
         sql`(${mcpCatalog.name} ILIKE ${"%" + search + "%"} OR ${mcpCatalog.description} ILIKE ${"%" + search + "%"})`,
@@ -48,18 +52,58 @@ marketplaceRoutes.get("/catalog", async (c) => {
     )
   }
   if (featured === "true") {
-    query = query.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.featured, true)))
+    localQuery = localQuery.where(and(eq(mcpCatalog.enabled, true), eq(mcpCatalog.featured, true)))
   }
 
-  const rows = await query
+  const localRows = await localQuery
+
+  // Mark local servers with source="featured" and map logoUrl
+  const localMapped = localRows.map((r: any) => ({
+    ...r,
+    logoUrl: r.logoUrl ?? r.logo_url ?? null,
+    githubUrl: r.githubUrl ?? r.github_url ?? null,
+    githubStars: r.githubStars ?? r.github_stars ?? 0,
+    source: "featured" as const,
+  }))
+
+  // 2. Fetch registry servers (community)
+  let registryResult = { servers: [] as CatalogEntry[], total: 0, hasMore: false }
+  if (featured !== "true") {
+    // Don't show registry servers when filtering featured-only
+    registryResult = await getRegistryServers({
+      search: search ?? undefined,
+      category: category ?? undefined,
+      limit,
+      offset: Math.max(0, offset - localMapped.length),
+    })
+  }
+
+  // 3. Merge: local first, then registry. Dedupe by slug.
+  const localSlugs = new Set(localMapped.map((r: any) => r.slug))
+  const registryFiltered = registryResult.servers.filter(s => !localSlugs.has(s.slug))
+
+  // On first page (offset=0), show local first then registry
+  // On subsequent pages, show only registry (local already shown)
+  let servers
+  if (offset === 0) {
+    servers = [...localMapped, ...registryFiltered]
+  } else {
+    servers = registryFiltered
+  }
+
+  const result = {
+    servers,
+    total: localMapped.length + registryResult.total,
+    hasMore: registryResult.hasMore,
+  }
 
   if (useCache) {
-    catalogCache = { data: rows, timestamp: Date.now() }
+    catalogCache = { data: result, timestamp: Date.now() }
   }
 
   c.header("Cache-Control", "public, max-age=300")
   c.header("X-Cache", useCache ? "MISS" : "BYPASS")
-  return c.json(rows)
+  return c.json(result)
 })
 
 marketplaceRoutes.get("/catalog/:slug", async (c) => {
@@ -93,6 +137,7 @@ marketplaceRoutes.get("/installations", async (c) => {
       catalogName: mcpCatalog.name,
       catalogSlug: mcpCatalog.slug,
       catalogIcon: mcpCatalog.icon,
+      catalogLogoUrl: mcpCatalog.logoUrl,
       catalogCategory: mcpCatalog.category,
       catalogAuthor: mcpCatalog.author,
     })
@@ -116,6 +161,7 @@ marketplaceRoutes.get("/installations", async (c) => {
         name: r.catalogName,
         slug: r.catalogSlug,
         icon: r.catalogIcon,
+        logoUrl: r.catalogLogoUrl,
         category: r.catalogCategory,
         author: r.catalogAuthor,
       },
@@ -128,6 +174,24 @@ const installSchema = z.object({
   catalogSlug: z.string().min(1),
   mcpName: z.string().min(1).max(100).optional(),
   configValues: z.record(z.string()).optional(),
+  // Registry server data (sent by frontend for servers not in local DB)
+  registryData: z.object({
+    name: z.string(),
+    description: z.string(),
+    category: z.string(),
+    serverType: z.string(),
+    configTemplate: z.record(z.unknown()),
+    configParams: z.array(z.object({
+      key: z.string(),
+      label: z.string(),
+      placeholder: z.string(),
+      required: z.boolean(),
+      secret: z.boolean(),
+    })).optional(),
+    logoUrl: z.string().nullable().optional(),
+    author: z.string().nullable().optional(),
+    githubUrl: z.string().nullable().optional(),
+  }).optional(),
 })
 
 marketplaceRoutes.post("/installations", zValidator("json", installSchema), async (c) => {
@@ -135,11 +199,38 @@ marketplaceRoutes.post("/installations", zValidator("json", installSchema), asyn
   const body = c.req.valid("json")
 
   try {
-    // Find catalog item
-    const [catalogItem] = await db
+    // Find catalog item in local DB
+    let [catalogItem] = await db
       .select()
       .from(mcpCatalog)
       .where(and(eq(mcpCatalog.slug, body.catalogSlug), eq(mcpCatalog.enabled, true)))
+
+    // If not in local DB but registry data provided, auto-create catalog entry
+    if (!catalogItem && body.registryData) {
+      const regId = `reg_${body.catalogSlug}`
+      await db.insert(mcpCatalog).values({
+        id: regId,
+        slug: body.catalogSlug,
+        name: body.registryData.name,
+        description: body.registryData.description,
+        category: body.registryData.category,
+        serverType: body.registryData.serverType,
+        configTemplate: body.registryData.configTemplate,
+        configParams: body.registryData.configParams ?? [],
+        logoUrl: body.registryData.logoUrl ?? null,
+        author: body.registryData.author ?? null,
+        githubUrl: body.registryData.githubUrl ?? null,
+        tags: [],
+        featured: false,
+        verified: false,
+        enabled: true,
+      }).onConflictDoNothing();
+
+      [catalogItem] = await db
+        .select()
+        .from(mcpCatalog)
+        .where(eq(mcpCatalog.slug, body.catalogSlug))
+    }
 
     if (!catalogItem) return c.json({ error: "Catalog item not found" }, 404)
 
@@ -172,10 +263,18 @@ marketplaceRoutes.post("/installations", zValidator("json", installSchema), asyn
     // Build resolved config from template + user values
     const template = catalogItem.configTemplate as Record<string, unknown>
     const resolvedConfig = { ...template }
-    if (body.configValues && template.environment) {
-      resolvedConfig.environment = {
-        ...(template.environment as Record<string, string>),
-        ...body.configValues,
+    if (body.configValues) {
+      if (template.environment) {
+        resolvedConfig.environment = {
+          ...(template.environment as Record<string, string>),
+          ...body.configValues,
+        }
+      }
+      if (template.headers) {
+        resolvedConfig.headers = {
+          ...(template.headers as Record<string, string>),
+          ...body.configValues,
+        }
       }
     }
 
@@ -321,7 +420,7 @@ marketplaceRoutes.patch(
   },
 )
 
-// Uninstall (soft delete)
+// Uninstall (hard delete)
 marketplaceRoutes.delete("/installations/:id", async (c) => {
   const auth = c.get("auth")
   const installId = c.req.param("id")
@@ -340,8 +439,7 @@ marketplaceRoutes.delete("/installations/:id", async (c) => {
   if (!installation) return c.json({ error: "Installation not found" }, 404)
 
   await db
-    .update(mcpInstallations)
-    .set({ timeDeleted: new Date() })
+    .delete(mcpInstallations)
     .where(eq(mcpInstallations.id, installId))
 
   // Decrement install count
