@@ -133,8 +133,17 @@ async function fetchAllServers(): Promise<RegistryServer[]> {
 
 // ── Name formatting ──
 
+const GENERIC_TITLES = new Set(["mcp", "server", "mcp server", "mcp-server", "tool", "tools"])
+
+function isGenericTitle(title: string | undefined): boolean {
+  if (!title) return true
+  return GENERIC_TITLES.has(title.toLowerCase().trim())
+}
+
 function formatServerName(rawName: string): string {
-  const base = rawName.includes("/") ? rawName.split("/").pop()! : rawName
+  let base = rawName.includes("/") ? rawName.split("/").pop()! : rawName
+  // Strip reverse-domain prefixes (com.notion → notion, io.github.foo → foo)
+  base = base.replace(/^(com|io|org|net|dev)\./i, "").replace(/^github\./i, "")
   return base
     .replace(/[-_]/g, " ")
     .replace(/\bmcp\b/gi, "MCP")
@@ -181,15 +190,13 @@ function deriveAuthor(server: RegistryServer["server"]): string | null {
 }
 
 function deriveEnvParams(envVars: Array<{ name: string; description?: string; isRequired?: boolean; isSecret?: boolean }> | undefined): CatalogEntry["configParams"] {
-  return (envVars ?? [])
-    .filter(e => e.isRequired)
-    .map(e => ({
-      key: e.name,
-      label: e.description ?? e.name,
-      placeholder: "",
-      required: true,
-      secret: e.isSecret ?? false,
-    }))
+  return (envVars ?? []).map(e => ({
+    key: e.name,
+    label: e.description ?? e.name,
+    placeholder: "",
+    required: e.isRequired ?? false,
+    secret: e.isSecret ?? false,
+  }))
 }
 
 function mapToEntry(reg: RegistryServer): CatalogEntry | null {
@@ -237,22 +244,20 @@ function mapToEntry(reg: RegistryServer): CatalogEntry | null {
     serverType = "remote"
     configTemplate = { type: "remote", url: remote.url }
 
-    const requiredHeaders = (remote.headers ?? []).filter(h => h.isRequired)
-    if (requiredHeaders.length > 0) {
+    const allHeaders = remote.headers ?? []
+    if (allHeaders.length > 0) {
       const headerDefaults: Record<string, string> = {}
-      requiredHeaders.forEach(h => { headerDefaults[h.name] = "" })
+      allHeaders.forEach(h => { headerDefaults[h.name] = "" })
       configTemplate = { ...configTemplate, headers: headerDefaults }
     }
 
-    configParams = (remote.headers ?? [])
-      .filter(h => h.isRequired)
-      .map(h => ({
-        key: h.name,
-        label: h.description ?? h.name,
-        placeholder: h.value ?? "",
-        required: true,
-        secret: h.isSecret ?? false,
-      }))
+    configParams = allHeaders.map(h => ({
+      key: h.name,
+      label: h.description ?? h.name,
+      placeholder: h.value ?? "",
+      required: h.isRequired ?? false,
+      secret: h.isSecret ?? false,
+    }))
   } else {
     // No packages and no remotes — server can't be installed
     return null
@@ -261,7 +266,7 @@ function mapToEntry(reg: RegistryServer): CatalogEntry | null {
   return {
     id: `reg_${slug}`,
     slug,
-    name: srv.title || formatServerName(srv.name),
+    name: isGenericTitle(srv.title) ? formatServerName(srv.name) : srv.title!,
     description: srv.description ?? "",
     category: deriveCategory(srv),
     icon: null,
