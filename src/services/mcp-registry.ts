@@ -127,10 +127,24 @@ async function fetchAllServers(): Promise<RegistryServer[]> {
   return allServers
 }
 
+// ── Name formatting ──
+
+function formatServerName(rawName: string): string {
+  const base = rawName.includes("/") ? rawName.split("/").pop()! : rawName
+  return base
+    .replace(/[-_]/g, " ")
+    .replace(/\bmcp\b/gi, "MCP")
+    .replace(/\bai\b/gi, "AI")
+    .replace(/\bapi\b/gi, "API")
+    .replace(/\bdb\b/gi, "DB")
+    .replace(/\bsdk\b/gi, "SDK")
+    .replace(/\b\w/g, c => c.toUpperCase())
+    .trim()
+}
+
 // ── Map registry server to Creor catalog format ──
 
 function deriveSlug(name: string): string {
-  // "com.example/my-server" → "my-server"
   const parts = name.split("/")
   return parts[parts.length - 1]
     .toLowerCase()
@@ -162,40 +176,60 @@ function deriveAuthor(server: RegistryServer["server"]): string | null {
   return null
 }
 
-function mapToEntry(reg: RegistryServer): CatalogEntry {
+function deriveEnvParams(envVars: Array<{ name: string; description?: string; isRequired?: boolean; isSecret?: boolean }> | undefined): CatalogEntry["configParams"] {
+  return (envVars ?? [])
+    .filter(e => e.isRequired)
+    .map(e => ({
+      key: e.name,
+      label: e.description ?? e.name,
+      placeholder: "",
+      required: true,
+      secret: e.isSecret ?? false,
+    }))
+}
+
+function mapToEntry(reg: RegistryServer): CatalogEntry | null {
   const srv = reg.server
   const meta = reg._meta?.["io.modelcontextprotocol.registry/official"]
   const slug = deriveSlug(srv.name)
 
-  // Derive config template from remotes or packages
+  // Derive config template from packages or remotes
   let serverType = "remote"
   let configTemplate: Record<string, unknown> = {}
   let configParams: CatalogEntry["configParams"] = []
 
   const remote = srv.remotes?.[0]
-  const pkg = srv.packages?.find(p => p.registryType === "npm" && p.transport?.type === "stdio")
+  const npmPkg = srv.packages?.find(p => p.registryType === "npm" && p.transport?.type === "stdio")
+  const pypiPkg = srv.packages?.find(p => p.registryType === "pypi")
+  const dockerPkg = srv.packages?.find(p => p.registryType === "oci")
 
-  if (pkg) {
-    // Local stdio server via npm
+  if (npmPkg) {
     serverType = "local"
     const envDefaults: Record<string, string> = {}
-    pkg.environmentVariables?.forEach(e => { envDefaults[e.name] = "" })
+    npmPkg.environmentVariables?.forEach(e => { envDefaults[e.name] = "" })
     configTemplate = {
       type: "local",
-      command: ["npx", "-y", pkg.identifier, ...(pkg.arguments ?? [])],
+      command: ["npx", "-y", npmPkg.identifier, ...(npmPkg.arguments ?? [])],
       ...(Object.keys(envDefaults).length > 0 ? { environment: envDefaults } : {}),
     }
-    configParams = (pkg.environmentVariables ?? [])
-      .filter(e => e.isRequired)
-      .map(e => ({
-        key: e.name,
-        label: e.description ?? e.name,
-        placeholder: "",
-        required: true,
-        secret: e.isSecret ?? false,
-      }))
+    configParams = deriveEnvParams(npmPkg.environmentVariables)
+  } else if (pypiPkg) {
+    serverType = "local"
+    const envDefaults: Record<string, string> = {}
+    pypiPkg.environmentVariables?.forEach(e => { envDefaults[e.name] = "" })
+    configTemplate = {
+      type: "local",
+      command: ["uvx", pypiPkg.identifier, ...(pypiPkg.arguments ?? [])],
+      ...(Object.keys(envDefaults).length > 0 ? { environment: envDefaults } : {}),
+    }
+    configParams = deriveEnvParams(pypiPkg.environmentVariables)
+  } else if (dockerPkg) {
+    serverType = "local"
+    configTemplate = {
+      type: "local",
+      command: ["docker", "run", "-i", "--rm", dockerPkg.identifier],
+    }
   } else if (remote) {
-    // Remote server
     serverType = "remote"
     configTemplate = { type: "remote", url: remote.url }
 
@@ -215,12 +249,15 @@ function mapToEntry(reg: RegistryServer): CatalogEntry {
         required: true,
         secret: h.isSecret ?? false,
       }))
+  } else {
+    // No packages and no remotes — server can't be installed
+    return null
   }
 
   return {
     id: `reg_${slug}`,
     slug,
-    name: srv.title ?? slug.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase()),
+    name: srv.title || formatServerName(srv.name),
     description: srv.description ?? "",
     category: deriveCategory(srv),
     icon: null,
@@ -262,6 +299,7 @@ export async function getRegistryServers(opts?: {
   category?: string
   limit?: number
   offset?: number
+  excludeSlugs?: Set<string>
 }): Promise<{ servers: CatalogEntry[]; total: number; hasMore: boolean }> {
   // Refresh cache if stale
   if (!cache || Date.now() - cache.timestamp > CACHE_TTL) {
@@ -270,16 +308,20 @@ export async function getRegistryServers(opts?: {
       const unique = dedupeLatest(raw)
       const entries = unique
         .map(mapToEntry)
-        .filter(e => e.description.length > 0) // skip entries with no description
+        .filter((e): e is CatalogEntry => e !== null && e.description.length > 0)
       cache = { entries, timestamp: Date.now() }
     } catch (err) {
       console.error("Failed to fetch MCP registry:", err)
-      // Return stale cache or empty
       if (!cache) return { servers: [], total: 0, hasMore: false }
     }
   }
 
   let filtered = cache.entries
+
+  // Exclude slugs already in local catalog (dedup)
+  if (opts?.excludeSlugs?.size) {
+    filtered = filtered.filter(s => !opts.excludeSlugs!.has(s.slug))
+  }
 
   // Filter by search
   if (opts?.search) {

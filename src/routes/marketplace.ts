@@ -66,30 +66,23 @@ marketplaceRoutes.get("/catalog", async (c) => {
     source: "featured" as const,
   }))
 
-  // 2. Fetch registry servers (community)
+  // 2. Fetch registry servers (community), deduped against local slugs
+  const localSlugs = new Set(localMapped.map((r: any) => r.slug))
   let registryResult = { servers: [] as CatalogEntry[], total: 0, hasMore: false }
   if (featured !== "true") {
-    // Don't show registry servers when filtering featured-only
     registryResult = await getRegistryServers({
       search: search ?? undefined,
       category: category ?? undefined,
       limit,
       offset: Math.max(0, offset - localMapped.length),
+      excludeSlugs: localSlugs,
     })
   }
 
-  // 3. Merge: local first, then registry. Dedupe by slug.
-  const localSlugs = new Set(localMapped.map((r: any) => r.slug))
-  const registryFiltered = registryResult.servers.filter(s => !localSlugs.has(s.slug))
-
-  // On first page (offset=0), show local first then registry
-  // On subsequent pages, show only registry (local already shown)
-  let servers
-  if (offset === 0) {
-    servers = [...localMapped, ...registryFiltered]
-  } else {
-    servers = registryFiltered
-  }
+  // On first page, show local first then registry; subsequent pages registry only
+  const servers = offset === 0
+    ? [...localMapped, ...registryResult.servers]
+    : registryResult.servers
 
   const result = {
     servers,
