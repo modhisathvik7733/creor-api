@@ -23,6 +23,20 @@ modelRoutes.get("/", async (c) => {
     .where(eq(models.enabled, true))
     .orderBy(models.sortOrder)
 
+  // Build direct tab-complete config so the engine can call the provider
+  // directly without going through the gateway proxy.
+  let tabCompleteConfig: { apiKey: string; baseUrl: string; modelId: string } | null = null
+  if (tabCompleteModel) {
+    const groqKey = process.env.GROQ_API_KEY
+    if (tabCompleteModel.startsWith("groq/") && groqKey) {
+      tabCompleteConfig = {
+        apiKey: groqKey,
+        baseUrl: "https://api.groq.com/openai/v1",
+        modelId: tabCompleteModel.replace("groq/", ""),
+      }
+    }
+  }
+
   return c.json({
     models: rows.map((m) => ({
       id: m.id,
@@ -39,6 +53,7 @@ modelRoutes.get("/", async (c) => {
     })),
     agentGenerateModel,
     tabCompleteModel,
+    tabCompleteConfig,
   })
 })
 
