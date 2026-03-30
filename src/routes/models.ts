@@ -27,12 +27,23 @@ modelRoutes.get("/", async (c) => {
   // directly without going through the gateway proxy.
   let tabCompleteConfig: { apiKey: string; baseUrl: string; modelId: string } | null = null
   if (tabCompleteModel) {
-    const groqKey = process.env.GROQ_API_KEY
-    if (tabCompleteModel.startsWith("groq/") && groqKey) {
-      tabCompleteConfig = {
-        apiKey: groqKey,
-        baseUrl: "https://api.groq.com/openai/v1",
-        modelId: tabCompleteModel.replace("groq/", ""),
+    if (tabCompleteModel.startsWith("nebius/")) {
+      const nebiusKey = process.env.NEBIUS_API_KEY
+      if (nebiusKey) {
+        tabCompleteConfig = {
+          apiKey: nebiusKey,
+          baseUrl: "https://api.tokenfactory.nebius.com/v1/",
+          modelId: `Qwen/${tabCompleteModel.replace("nebius/", "")}`,
+        }
+      }
+    } else if (tabCompleteModel.startsWith("groq/")) {
+      const groqKey = process.env.GROQ_API_KEY
+      if (groqKey) {
+        tabCompleteConfig = {
+          apiKey: groqKey,
+          baseUrl: "https://api.groq.com/openai/v1",
+          modelId: tabCompleteModel.replace("groq/", ""),
+        }
       }
     }
   }
