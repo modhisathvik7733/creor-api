@@ -21,6 +21,7 @@ marketplaceRoutes.get("/catalog", async (c) => {
   const category = c.req.query("category")
   const search = c.req.query("search")
   const featured = c.req.query("featured")
+  const showAll = c.req.query("showAll") === "true"
   const limit = parseInt(c.req.query("limit") ?? "25")
   const offset = parseInt(c.req.query("offset") ?? "0")
 
@@ -67,6 +68,7 @@ marketplaceRoutes.get("/catalog", async (c) => {
       limit,
       offset: Math.max(0, offset - localMapped.length),
       excludeSlugs: localSlugs,
+      verifiedOnly: !showAll,
     })
   }
 

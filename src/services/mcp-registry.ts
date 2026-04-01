@@ -391,6 +391,7 @@ export async function getRegistryServers(opts?: {
   limit?: number
   offset?: number
   excludeSlugs?: Set<string>
+  verifiedOnly?: boolean
 }): Promise<{ servers: CatalogEntry[]; total: number; hasMore: boolean }> {
   const allEntries = await ensureCache()
   let filtered = allEntries
@@ -398,6 +399,11 @@ export async function getRegistryServers(opts?: {
   // Exclude slugs already in local catalog (dedup)
   if (opts?.excludeSlugs?.size) {
     filtered = filtered.filter(s => !opts.excludeSlugs!.has(s.slug))
+  }
+
+  // By default only show verified (active) servers; pass verifiedOnly=false to show all
+  if (opts?.verifiedOnly !== false) {
+    filtered = filtered.filter(s => s.verified)
   }
 
   // Filter by search
