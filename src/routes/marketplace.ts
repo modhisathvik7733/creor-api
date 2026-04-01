@@ -523,16 +523,20 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     result[displayName] = config
   }
 
-  // Append user custom MCPs (userId-scoped)
-  const customRows = await db
-    .select()
-    .from(userCustomMcps)
-    .where(
-      and(
-        eq(userCustomMcps.userId, auth.userId),
-        isNull(userCustomMcps.timeDeleted),
-      ),
-    )
+  // Append user custom MCPs (userId-scoped) — wrapped in try/catch so a missing
+  // table (migration not yet applied) doesn't break the entire sync endpoint
+  let customRows: typeof userCustomMcps.$inferSelect[] = []
+  try {
+    customRows = await db
+      .select()
+      .from(userCustomMcps)
+      .where(
+        and(
+          eq(userCustomMcps.userId, auth.userId),
+          isNull(userCustomMcps.timeDeleted),
+        ),
+      )
+  } catch { /* table not yet migrated — skip custom MCPs */ }
 
   for (const custom of customRows) {
     const config = { ...(custom.config as Record<string, unknown>) }
@@ -591,16 +595,19 @@ marketplaceRoutes.use("/user-mcps", requireAuth)
 marketplaceRoutes.get("/user-mcps", async (c) => {
   const auth = c.get("auth")
 
-  const rows = await db
-    .select()
-    .from(userCustomMcps)
-    .where(
-      and(
-        eq(userCustomMcps.userId, auth.userId),
-        isNull(userCustomMcps.timeDeleted),
-      ),
-    )
-    .orderBy(sql`${userCustomMcps.timeCreated} DESC`)
+  let rows: typeof userCustomMcps.$inferSelect[] = []
+  try {
+    rows = await db
+      .select()
+      .from(userCustomMcps)
+      .where(
+        and(
+          eq(userCustomMcps.userId, auth.userId),
+          isNull(userCustomMcps.timeDeleted),
+        ),
+      )
+      .orderBy(sql`${userCustomMcps.timeCreated} DESC`)
+  } catch { return c.json([]) }
 
   // Never return encrypted configValues to client
   return c.json(rows.map(r => ({
