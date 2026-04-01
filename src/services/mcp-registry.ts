@@ -447,6 +447,7 @@ export async function getRegistryServers(opts?: {
   limit?: number
   offset?: number
   excludeSlugs?: Set<string>
+  excludeGithubUrls?: Set<string>
   verifiedOnly?: boolean
 }): Promise<{ servers: CatalogEntry[]; total: number; hasMore: boolean }> {
   const allEntries = await ensureCache()
@@ -455,6 +456,14 @@ export async function getRegistryServers(opts?: {
   // Exclude slugs already in local catalog (dedup)
   if (opts?.excludeSlugs?.size) {
     filtered = filtered.filter(s => !opts.excludeSlugs!.has(s.slug))
+  }
+
+  // Exclude by normalized GitHub URL (catches same repo with different slugs)
+  if (opts?.excludeGithubUrls?.size) {
+    filtered = filtered.filter(s => {
+      const n = normalizeGithubUrl(s.githubUrl)
+      return !n || !opts.excludeGithubUrls!.has(n)
+    })
   }
 
   // By default show only curated servers (quality filter).

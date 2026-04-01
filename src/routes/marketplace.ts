@@ -59,8 +59,17 @@ marketplaceRoutes.get("/catalog", async (c) => {
     source: "featured" as const,
   }))
 
-  // 2. Fetch registry servers (community), deduped against local slugs
+  // 2. Fetch registry servers (community), deduped against local slugs + github URLs
   const localSlugs = new Set(localMapped.map((r: any) => r.slug))
+  const localGithubUrls = new Set(
+    localMapped
+      .map((r: any) => {
+        const u = r.githubUrl ?? r.github_url ?? null
+        if (!u) return null
+        return u.toLowerCase().replace(/\.git$/, "").replace(/\/$/, "").split("/tree/")[0].split("/blob/")[0]
+      })
+      .filter(Boolean) as string[]
+  )
   let registryResult = { servers: [] as CatalogEntry[], total: 0, hasMore: false }
   if (featured !== "true") {
     registryResult = await getRegistryServers({
@@ -69,6 +78,7 @@ marketplaceRoutes.get("/catalog", async (c) => {
       limit,
       offset: Math.max(0, offset - localMapped.length),
       excludeSlugs: localSlugs,
+      excludeGithubUrls: localGithubUrls,
       verifiedOnly: !showAll,
     })
   }
