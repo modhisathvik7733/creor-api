@@ -101,6 +101,65 @@ export interface CatalogEntry {
 
 let memCache: { entries: CatalogEntry[]; timestamp: number } | null = null
 
+// ── Cline Marketplace Cache (quality filter) ──
+// Cline's public API returns their hand-curated, validated MCP list.
+// We use it as a quality signal: default view shows only registry entries
+// whose githubUrl appears in Cline's list.
+
+let clineUrlCache: Set<string> | null = null
+let clineLastFetch = 0
+let clineFetchPromise: Promise<Set<string>> | null = null
+const CLINE_CACHE_TTL = 24 * 60 * 60 * 1000 // 24h — Cline's list rarely changes
+
+function normalizeGithubUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  return url
+    .toLowerCase()
+    .replace('http://', 'https://')
+    .replace('www.github.com', 'github.com')
+    .replace(/\.git$/, '')
+    .replace(/\/$/, '')
+    .split('/tree/')[0]
+    .split('/blob/')[0]
+}
+
+async function fetchClineUrls(): Promise<Set<string>> {
+  try {
+    const res = await fetch('https://api.cline.bot/v1/mcp/marketplace', {
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'creor-marketplace/1.0' },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (res.ok) {
+      const data = await res.json() as { items?: Array<{ githubUrl: string }> }
+      const items = data.items ?? []
+      const urls = new Set(items.map(i => normalizeGithubUrl(i.githubUrl)).filter(Boolean) as string[])
+      clineUrlCache = urls
+      clineLastFetch = Date.now()
+      // NOTE: if Cline returns { items: [] } (valid empty list), urls.size === 0
+      // and the filter falls through to the registry 'verified' flag — intentional behavior
+      console.log(`[mcp-registry] Cline cache loaded: ${urls.size} URLs`)
+      return urls
+    }
+  } catch (err) {
+    console.warn('[mcp-registry] Cline API unreachable, using fallback:', err instanceof Error ? err.message : err)
+  }
+  return clineUrlCache ?? new Set() // return stale cache on error, or empty if never loaded
+}
+
+async function ensureClineUrls(): Promise<Set<string>> {
+  if (clineUrlCache && Date.now() - clineLastFetch < CLINE_CACHE_TTL) {
+    return clineUrlCache
+  }
+  // Promise lock — prevents stampede on cold start (multiple concurrent requests)
+  if (!clineFetchPromise) {
+    clineFetchPromise = fetchClineUrls().finally(() => { clineFetchPromise = null })
+  }
+  return clineFetchPromise
+}
+
+// Warm Cline cache on module load so first user doesn't pay the fetch latency
+ensureClineUrls().catch(() => {})
+
 // ── Fetch all pages from registry ──
 
 async function fetchAllServers(): Promise<RegistryServer[]> {
@@ -401,9 +460,22 @@ export async function getRegistryServers(opts?: {
     filtered = filtered.filter(s => !opts.excludeSlugs!.has(s.slug))
   }
 
-  // By default only show verified (active) servers; pass verifiedOnly=false to show all
+  // By default show only Cline-curated servers (quality filter).
+  // Falls back to registry 'verified' flag if Cline API is unreachable or returns empty.
+  // Pass verifiedOnly=false (showAll=true in UI) to skip all filtering.
   if (opts?.verifiedOnly !== false) {
-    filtered = filtered.filter(s => s.verified)
+    const clineUrls = await ensureClineUrls()
+    if (clineUrls.size > 0) {
+      const before = filtered.length
+      filtered = filtered.filter(s => {
+        const normalized = normalizeGithubUrl(s.githubUrl)
+        return normalized !== null && clineUrls.has(normalized)
+      })
+      console.log(`[mcp-registry] Cline filter: ${filtered.length}/${before} entries matched`)
+    } else {
+      // Fallback: Cline API unreachable or returned empty list
+      filtered = filtered.filter(s => s.verified)
+    }
   }
 
   // Filter by search
