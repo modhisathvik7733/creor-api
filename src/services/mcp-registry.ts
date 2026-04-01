@@ -9,7 +9,6 @@
 import { db } from "../db/client.ts"
 import { mcpRegistryCache } from "../db/schema.ts"
 import { eq } from "drizzle-orm"
-import { CURATED_MCP_GITHUB_URLS } from "../data/curated-mcp-urls.ts"
 
 const REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0"
 const CACHE_TTL = 60 * 60 * 1000 // 1 hour
@@ -136,9 +135,7 @@ export function isOfficialMcp(githubUrl: string | null | undefined): boolean {
 
 let memCache: { entries: CatalogEntry[]; timestamp: number } | null = null
 
-// ── Curated MCP allowlist (quality filter) ──
-// GitHub URLs from curated-mcp-urls.ts, normalized once at startup.
-// Default marketplace view shows only servers whose githubUrl is in this set.
+// ── GitHub URL normalizer ──
 
 function normalizeGithubUrl(url: string | null | undefined): string | null {
   if (!url) return null
@@ -151,10 +148,6 @@ function normalizeGithubUrl(url: string | null | undefined): string | null {
     .split('/tree/')[0]
     .split('/blob/')[0]
 }
-
-const CURATED_URL_SET = new Set(
-  CURATED_MCP_GITHUB_URLS.map(normalizeGithubUrl).filter(Boolean) as string[]
-)
 
 // ── Fetch all pages from registry ──
 
@@ -466,13 +459,10 @@ export async function getRegistryServers(opts?: {
     })
   }
 
-  // By default show only curated servers (quality filter).
-  // Pass verifiedOnly=false (showAll=true in UI) to skip all filtering.
-  if (opts?.verifiedOnly !== false) {
-    filtered = filtered.filter(s => {
-      const normalized = normalizeGithubUrl(s.githubUrl)
-      return normalized !== null && CURATED_URL_SET.has(normalized)
-    })
+  // Show all registry items by default — the registry itself is a quality source.
+  // verifiedOnly=true restricts to registry-verified (active status) servers only.
+  if (opts?.verifiedOnly === true) {
+    filtered = filtered.filter(s => s.verified)
   }
 
   // Filter by search
