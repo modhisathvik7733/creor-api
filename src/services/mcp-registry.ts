@@ -9,6 +9,7 @@
 import { db } from "../db/client.ts"
 import { mcpRegistryCache } from "../db/schema.ts"
 import { eq } from "drizzle-orm"
+import { CURATED_MCP_GITHUB_URLS } from "../data/curated-mcp-urls.ts"
 
 const REGISTRY_BASE = "https://registry.modelcontextprotocol.io/v0"
 const CACHE_TTL = 60 * 60 * 1000 // 1 hour
@@ -101,15 +102,9 @@ export interface CatalogEntry {
 
 let memCache: { entries: CatalogEntry[]; timestamp: number } | null = null
 
-// ── Cline Marketplace Cache (quality filter) ──
-// Cline's public API returns their hand-curated, validated MCP list.
-// We use it as a quality signal: default view shows only registry entries
-// whose githubUrl appears in Cline's list.
-
-let clineUrlCache: Set<string> | null = null
-let clineLastFetch = 0
-let clineFetchPromise: Promise<Set<string>> | null = null
-const CLINE_CACHE_TTL = 24 * 60 * 60 * 1000 // 24h — Cline's list rarely changes
+// ── Curated MCP allowlist (quality filter) ──
+// GitHub URLs from curated-mcp-urls.ts, normalized once at startup.
+// Default marketplace view shows only servers whose githubUrl is in this set.
 
 function normalizeGithubUrl(url: string | null | undefined): string | null {
   if (!url) return null
@@ -123,42 +118,9 @@ function normalizeGithubUrl(url: string | null | undefined): string | null {
     .split('/blob/')[0]
 }
 
-async function fetchClineUrls(): Promise<Set<string>> {
-  try {
-    const res = await fetch('https://api.cline.bot/v1/mcp/marketplace', {
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'creor-marketplace/1.0' },
-      signal: AbortSignal.timeout(5000),
-    })
-    if (res.ok) {
-      const data = await res.json() as { items?: Array<{ githubUrl: string }> }
-      const items = data.items ?? []
-      const urls = new Set(items.map(i => normalizeGithubUrl(i.githubUrl)).filter(Boolean) as string[])
-      clineUrlCache = urls
-      clineLastFetch = Date.now()
-      // NOTE: if Cline returns { items: [] } (valid empty list), urls.size === 0
-      // and the filter falls through to the registry 'verified' flag — intentional behavior
-      console.log(`[mcp-registry] Cline cache loaded: ${urls.size} URLs`)
-      return urls
-    }
-  } catch (err) {
-    console.warn('[mcp-registry] Cline API unreachable, using fallback:', err instanceof Error ? err.message : err)
-  }
-  return clineUrlCache ?? new Set() // return stale cache on error, or empty if never loaded
-}
-
-async function ensureClineUrls(): Promise<Set<string>> {
-  if (clineUrlCache && Date.now() - clineLastFetch < CLINE_CACHE_TTL) {
-    return clineUrlCache
-  }
-  // Promise lock — prevents stampede on cold start (multiple concurrent requests)
-  if (!clineFetchPromise) {
-    clineFetchPromise = fetchClineUrls().finally(() => { clineFetchPromise = null })
-  }
-  return clineFetchPromise
-}
-
-// Warm Cline cache on module load so first user doesn't pay the fetch latency
-ensureClineUrls().catch(() => {})
+const CURATED_URL_SET = new Set(
+  CURATED_MCP_GITHUB_URLS.map(normalizeGithubUrl).filter(Boolean) as string[]
+)
 
 // ── Fetch all pages from registry ──
 
@@ -460,22 +422,13 @@ export async function getRegistryServers(opts?: {
     filtered = filtered.filter(s => !opts.excludeSlugs!.has(s.slug))
   }
 
-  // By default show only Cline-curated servers (quality filter).
-  // Falls back to registry 'verified' flag if Cline API is unreachable or returns empty.
+  // By default show only curated servers (quality filter).
   // Pass verifiedOnly=false (showAll=true in UI) to skip all filtering.
   if (opts?.verifiedOnly !== false) {
-    const clineUrls = await ensureClineUrls()
-    if (clineUrls.size > 0) {
-      const before = filtered.length
-      filtered = filtered.filter(s => {
-        const normalized = normalizeGithubUrl(s.githubUrl)
-        return normalized !== null && clineUrls.has(normalized)
-      })
-      console.log(`[mcp-registry] Cline filter: ${filtered.length}/${before} entries matched`)
-    } else {
-      // Fallback: Cline API unreachable or returned empty list
-      filtered = filtered.filter(s => s.verified)
-    }
+    filtered = filtered.filter(s => {
+      const normalized = normalizeGithubUrl(s.githubUrl)
+      return normalized !== null && CURATED_URL_SET.has(normalized)
+    })
   }
 
   // Filter by search
