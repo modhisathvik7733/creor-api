@@ -1,0 +1,58 @@
+name: Refresh Curated MCP URLs
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6am UTC
+  workflow_dispatch:       # Manual trigger from GitHub UI
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.8
+
+      - name: Fetch and merge curated MCP URLs
+        run: bun run scripts/refresh-curated-mcps.ts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for changes
+        id: check
+        run: |
+          if git diff --quiet src/data/curated-mcp-urls.ts; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            git diff --stat src/data/curated-mcp-urls.ts
+          fi
+
+      - name: Create Pull Request
+        if: steps.check.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: refresh curated MCP URLs from punkpeye/awesome-mcp-servers"
+          title: "Refresh curated MCP URLs from awesome-mcp-servers"
+          body: |
+            Automated daily refresh of curated MCP server URLs.
+
+            **Source:** https://github.com/punkpeye/awesome-mcp-servers
+
+            New GitHub URLs found in the source README have been merged into
+            `src/data/curated-mcp-urls.ts`. Existing entries are never removed.
+
+            Please review the diff before merging.
+          branch: auto/refresh-curated-mcps
+          base: main
+          labels: automation, marketplace
+          delete-branch: true

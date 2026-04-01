@@ -93,9 +93,43 @@ export interface CatalogEntry {
   tags: string[]
   featured: boolean
   verified: boolean
+  official: boolean
   installCount: number
   version: string | null
   source: "registry"
+}
+
+// ── Official MCP orgs ──
+
+const OFFICIAL_ORGS = new Set([
+  "modelcontextprotocol",
+  "awslabs",
+  "microsoft",
+  "github",
+  "cloudflare",
+  "stripe",
+  "makenotion",
+  "supabase-community",
+  "googleapis",
+  "sveltejs",
+  "anthropics",
+  "neondatabase",
+  "browserbase",
+  "mendableai",
+  "qdrant",
+  "executeautomation",
+  "elevenlabs",
+  "motherduckdb",
+  "postmanlabs",
+  "auth0",
+  "paypal",
+  "posthog",
+])
+
+export function isOfficialMcp(githubUrl: string | null | undefined): boolean {
+  if (!githubUrl) return false
+  const match = githubUrl.match(/github\.com\/([^/]+)/)
+  return match ? OFFICIAL_ORGS.has(match[1].toLowerCase()) : false
 }
 
 // ── L1 In-Memory Cache (within same Edge Function invocation) ──
@@ -305,6 +339,7 @@ function mapToEntry(reg: RegistryServer): CatalogEntry | null {
     tags: [],
     featured: false,
     verified: meta?.status === "active",
+    official: isOfficialMcp(srv.repository?.url),
     installCount: 0,
     version: srv.version ?? null,
     source: "registry",

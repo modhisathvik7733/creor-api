@@ -2,13 +2,13 @@ import { Hono } from "hono"
 import { z } from "zod"
 import { zValidator } from "@hono/zod-validator"
 import { db } from "../db/client.ts"
-import { mcpCatalog, mcpInstallations } from "../db/schema.ts"
-import { eq, and, isNull, ilike, sql } from "drizzle-orm"
+import { mcpCatalog, mcpInstallations, userCustomMcps } from "../db/schema.ts"
+import { eq, and, isNull, sql } from "drizzle-orm"
 import { requireAuth, requireAdmin, type AuthContext } from "../middleware/auth.ts"
 import { createId } from "../lib/id.ts"
 import { encrypt, decrypt } from "../lib/crypto.ts"
 import { logAudit } from "../lib/audit.ts"
-import { getRegistryServers, type CatalogEntry } from "../services/mcp-registry.ts"
+import { getRegistryServers, isOfficialMcp, type CatalogEntry } from "../services/mcp-registry.ts"
 
 export const marketplaceRoutes = new Hono<{ Variables: { auth: AuthContext } }>()
 
@@ -55,6 +55,7 @@ marketplaceRoutes.get("/catalog", async (c) => {
     logoUrl: r.logoUrl ?? r.logo_url ?? null,
     githubUrl: r.githubUrl ?? r.github_url ?? null,
     githubStars: r.githubStars ?? r.github_stars ?? 0,
+    official: isOfficialMcp(r.githubUrl ?? r.github_url ?? null),
     source: "featured" as const,
   }))
 
@@ -514,6 +515,44 @@ marketplaceRoutes.get("/installations/sync", async (c) => {
     result[displayName] = config
   }
 
+  // Append user custom MCPs (userId-scoped)
+  const customRows = await db
+    .select()
+    .from(userCustomMcps)
+    .where(
+      and(
+        eq(userCustomMcps.userId, auth.userId),
+        isNull(userCustomMcps.timeDeleted),
+      ),
+    )
+
+  for (const custom of customRows) {
+    const config = { ...(custom.config as Record<string, unknown>) }
+
+    // Decrypt and merge secrets
+    if (custom.configValues) {
+      try {
+        const secrets = JSON.parse(await decrypt(custom.configValues)) as Record<string, string>
+        if (config.environment) {
+          config.environment = { ...(config.environment as Record<string, string>), ...secrets }
+        }
+        if (config.headers) {
+          config.headers = { ...(config.headers as Record<string, string>), ...secrets }
+        }
+      } catch { /* skip bad decrypt */ }
+    }
+
+    if (!custom.enabled) {
+      config.enabled = false
+    } else {
+      delete config.enabled
+    }
+    config._customMcpId = custom.id
+
+    const key = `custom-${custom.name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-')}`
+    result[key] = config
+  }
+
   return c.json(result)
 })
 
@@ -533,6 +572,146 @@ marketplaceRoutes.get("/realtime-config", requireAuth, async (c) => {
     workspaceId: auth.workspaceId,
     table: "mcp_installations",
   })
+})
+
+// ── User Custom MCPs ──
+
+marketplaceRoutes.use("/user-mcps/*", requireAuth)
+marketplaceRoutes.use("/user-mcps", requireAuth)
+
+// List user's custom MCPs
+marketplaceRoutes.get("/user-mcps", async (c) => {
+  const auth = c.get("auth")
+
+  const rows = await db
+    .select()
+    .from(userCustomMcps)
+    .where(
+      and(
+        eq(userCustomMcps.userId, auth.userId),
+        isNull(userCustomMcps.timeDeleted),
+      ),
+    )
+    .orderBy(sql`${userCustomMcps.timeCreated} DESC`)
+
+  // Never return encrypted configValues to client
+  return c.json(rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    serverType: r.serverType,
+    config: r.config,
+    enabled: r.enabled,
+    timeCreated: r.timeCreated,
+  })))
+})
+
+// Create a custom MCP
+const customMcpSchema = z.object({
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).optional(),
+  serverType: z.enum(["local", "remote"]),
+  command: z.string().min(1).optional(),
+  url: z.string().url().optional(),
+  envVars: z.record(z.string(), z.string()).optional(),
+})
+
+marketplaceRoutes.post("/user-mcps", zValidator("json", customMcpSchema), async (c) => {
+  const auth = c.get("auth")
+  const body = c.req.valid("json")
+
+  if (body.serverType === "local" && !body.command) {
+    return c.json({ error: "command is required for local servers" }, 400)
+  }
+  if (body.serverType === "remote" && !body.url) {
+    return c.json({ error: "url is required for remote servers" }, 400)
+  }
+
+  // Build engine-compatible config object
+  let config: Record<string, unknown>
+  if (body.serverType === "local") {
+    const cmd = body.command!.trim().split(/\s+/)
+    config = {
+      type: "local",
+      command: cmd,
+      ...(body.envVars && Object.keys(body.envVars).length > 0
+        ? { environment: body.envVars }
+        : {}),
+    }
+  } else {
+    config = {
+      type: "remote",
+      url: body.url!,
+      ...(body.envVars && Object.keys(body.envVars).length > 0
+        ? { headers: body.envVars }
+        : {}),
+    }
+  }
+
+  // Encrypt env vars / headers
+  let encryptedValues: string | null = null
+  if (body.envVars && Object.keys(body.envVars).length > 0) {
+    encryptedValues = await encrypt(JSON.stringify(body.envVars))
+  }
+
+  const id = createId("ucmcp")
+
+  await db.insert(userCustomMcps).values({
+    id,
+    userId: auth.userId,
+    workspaceId: auth.workspaceId,
+    name: body.name,
+    description: body.description ?? null,
+    serverType: body.serverType,
+    config,
+    configValues: encryptedValues,
+    enabled: true,
+  })
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "marketplace.custom_mcp.create",
+    resourceType: "user_custom_mcp",
+    resourceId: id,
+    metadata: { name: body.name, serverType: body.serverType },
+  })
+
+  return c.json({ id, name: body.name }, 201)
+})
+
+// Delete (soft) a custom MCP
+marketplaceRoutes.delete("/user-mcps/:id", async (c) => {
+  const auth = c.get("auth")
+  const id = c.req.param("id")
+
+  const [row] = await db
+    .select({ id: userCustomMcps.id })
+    .from(userCustomMcps)
+    .where(
+      and(
+        eq(userCustomMcps.id, id),
+        eq(userCustomMcps.userId, auth.userId),
+        isNull(userCustomMcps.timeDeleted),
+      ),
+    )
+
+  if (!row) return c.json({ error: "Not found" }, 404)
+
+  await db
+    .update(userCustomMcps)
+    .set({ timeDeleted: new Date() })
+    .where(eq(userCustomMcps.id, id))
+
+  void logAudit({
+    workspaceId: auth.workspaceId,
+    userId: auth.userId,
+    action: "marketplace.custom_mcp.delete",
+    resourceType: "user_custom_mcp",
+    resourceId: id,
+  })
+
+  return c.json({ success: true })
 })
 
 // ── Admin: Catalog management ──

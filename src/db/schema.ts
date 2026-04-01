@@ -598,6 +598,34 @@ export const mcpRegistryCache = pgTable("mcp_registry_cache", {
   refreshedAt: timestamp("refreshed_at").defaultNow().notNull(),
 })
 
+// ── User Custom MCPs (account-level, not published to marketplace) ──
+
+export const userCustomMcps = pgTable(
+  "user_custom_mcps",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id),
+    name: text("name").notNull(),
+    description: text("description"),
+    serverType: text("server_type").notNull(), // "local" | "remote"
+    config: jsonb("config").notNull(),          // { type, command/url, environment/headers }
+    configValues: text("config_values"),        // encrypted secrets
+    enabled: boolean("enabled").notNull().default(true),
+    timeCreated: timestamp("time_created").defaultNow().notNull(),
+    timeUpdated: timestamp("time_updated").defaultNow().notNull(),
+    timeDeleted: timestamp("time_deleted"),
+  },
+  (table) => [
+    index("idx_user_custom_mcps_user").on(table.userId),
+    index("idx_user_custom_mcps_workspace").on(table.workspaceId),
+  ],
+)
+
 export const mcpInstallationsRelations = relations(mcpInstallations, ({ one }) => ({
   workspace: one(workspaces, {
     fields: [mcpInstallations.workspaceId],
